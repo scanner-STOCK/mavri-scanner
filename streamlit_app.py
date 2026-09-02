@@ -11,6 +11,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import time
 from datetime import datetime, timezone, timedelta
 
 st.set_page_config(page_title="MAVRI", layout="wide",
@@ -476,7 +477,13 @@ min_dv = f4.number_input("מחזור מינ׳ (מ׳ $)", 1.0, 500.0, float(P["dv
                          help="מחזור בדולרים, לא במניות. זה המדד הנכון לנזילות.")
 atr_abs = f5.number_input("ATR מינ׳ $", 0.0, 20.0, float(P["atr"]), 0.1)
 f6.markdown("<div style='height:1.55rem'></div>", unsafe_allow_html=True)
-go_ = f6.button("סרוק את השוק", type="primary", use_container_width=True)
+s1, s2 = f6.columns([2, 1])
+go_ = s1.button("סרוק את השוק", type="primary", use_container_width=True)
+fresh = s2.button("↻", use_container_width=True,
+                  help="סריקה טרייה — מתעלם מהנתונים השמורים ומוריד הכל מחדש. איטי יותר.")
+if fresh:
+    fetch.clear()
+    go_ = True
 
 with st.expander("סינון מתקדם"):
     g1, g2, g3, g4 = st.columns(4)
@@ -669,9 +676,10 @@ if st.session_state.get("open"):
 # ---------------------------------------------------------------- scan
 
 if go_:
+    t0 = time.time()
     uni = build_universe(limit)
     prog, note = st.progress(0.0), st.empty()
-    rows, drop, liq = [], {}, 0
+    rows, drop, liq, last_bar = [], {}, 0, None
     batches = [tuple(uni[i:i + 120]) for i in range(0, len(uni), 120)]
     for i, b in enumerate(batches):
         note.caption(f"{i+1} / {len(batches)}  ·  {len(rows)} התאמות")
@@ -689,6 +697,8 @@ if go_:
                     drop["נפח מניות נמוך"] = drop.get("נפח מניות נמוך", 0) + 1
                     continue
                 liq += 1
+                if last_bar is None:
+                    last_bar = d.index[-1]
                 A = prep(d)
                 r, why = core(A, len(A["c"]) - 1, C)
                 if r is None:
@@ -704,8 +714,11 @@ if go_:
     prog.empty()
     note.empty()
     rows.sort(key=lambda x: -x["dry"])
-    st.session_state.update(rows=rows, stats=(len(uni), liq), drop=drop, open=None,
-                            scanned_at=datetime.now(il).strftime("%H:%M"))
+    st.session_state.update(
+        rows=rows, stats=(len(uni), liq), drop=drop, open=None,
+        scanned_at=datetime.now(il).strftime("%H:%M"),
+        took=round(time.time() - t0, 1), cached=not fresh,
+        data_date=last_bar.strftime("%d.%m.%y") if last_bar is not None else "—")
 
 # ---------------------------------------------------------------- results
 
@@ -717,13 +730,20 @@ else:
     rows = st.session_state["rows"]
     u, l_ = st.session_state["stats"]
     top_dry = max((r["dry"] for r in rows), default=0)
+    took = st.session_state.get("took", 0)
+    src = "מטמון" if st.session_state.get("cached") else "הורדה טרייה"
     st.markdown(f"""<div class="kpi">
 <div><b>{u:,}</b><span>נסרקו</span></div>
 <div><b>{l_:,}</b><span>עברו נזילות</span></div>
 <div class="hi"><b>{len(rows)}</b><span>בתבנית</span></div>
 <div><b>{top_dry:.2f}×</b><span>יובש מרבי</span></div>
-<div><b>{st.session_state.get('scanned_at','—')}</b><span>עודכן</span></div>
+<div><b>{st.session_state.get('data_date','—')}</b><span>נתונים עד</span></div>
+<div><b>{took:.0f}s</b><span>{src}</span></div>
+<div><b>{st.session_state.get('scanned_at','—')}</b><span>נסרק בשעה</span></div>
 </div>""", unsafe_allow_html=True)
+    if st.session_state.get("cached") and took < 20:
+        st.caption("הסריקה הייתה מהירה כי הנתונים כבר היו שמורים מסריקה קודמת "
+                   "(נשמרים לשעה). ללחיצה על ↻ תרד הורדה טרייה מהשוק.")
 
     if not rows:
         st.markdown('<div class="empty">אין מניות בתבנית בסינון הזה.<br>'

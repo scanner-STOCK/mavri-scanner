@@ -94,8 +94,46 @@ h3{font-family:'Frank Ruhl Libre',serif !important;font-weight:500 !important;
    color:var(--tx) !important;direction:rtl;}
 label{color:var(--mu) !important;font-size:.75rem !important;}
 div[data-testid="stExpander"]{border:1px solid var(--ln);border-radius:4px;background:var(--pan);}
+.fn{direction:rtl;margin:.2rem 0 .4rem;}
+.fn .row{display:flex;align-items:center;gap:.6rem;margin:.22rem 0;}
+.fn .nm{width:150px;font-size:.72rem;color:var(--mu);text-align:right;}
+.fn .tr{flex:1;height:16px;background:var(--rz);border-radius:2px;overflow:hidden;}
+.fn .fl{height:100%;background:linear-gradient(90deg,#2C4A57,#3E6B7C);}
+.fn .fl.cut{background:linear-gradient(90deg,#5A2A2E,#8E4046);}
+.fn .vl{width:64px;font-size:.72rem;color:var(--dm);font-variant-numeric:tabular-nums;
+        text-align:left;direction:ltr;}
+
+.dh{display:flex;align-items:flex-end;justify-content:space-between;gap:1rem;
+    border-bottom:1px solid var(--ln);padding-bottom:.7rem;margin-bottom:.9rem;flex-wrap:wrap;}
+.dh .sym{font-family:'Frank Ruhl Libre',serif;font-size:2.3rem;font-weight:700;
+         color:var(--tx);letter-spacing:.04em;line-height:1;}
+.dh .pr{font-family:'Frank Ruhl Libre',serif;font-size:1.5rem;color:var(--mu);
+        font-variant-numeric:tabular-nums;}
+.dh .ch{font-size:.9rem;font-variant-numeric:tabular-nums;}
+.dh .up{color:var(--lg);} .dh .dn{color:var(--sh);}
+
+.sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:1px;
+    background:var(--ln);border:1px solid var(--ln);border-radius:4px;overflow:hidden;
+    direction:rtl;margin:.2rem 0 1rem;}
+.sg div{background:var(--pan);padding:.55rem .7rem;}
+.sg b{display:block;font-family:'Frank Ruhl Libre',serif;font-size:1.08rem;font-weight:500;
+      color:var(--tx);font-variant-numeric:tabular-nums;line-height:1.25;}
+.sg span{font-size:.65rem;color:var(--dm);}
+.sg div.gd b{color:var(--gd);} .sg div.up b{color:var(--lg);} .sg div.dn b{color:var(--sh);}
+
+.rmap{position:relative;height:52px;margin:.5rem 0 1rem;direction:ltr;}
+.rmap .base{position:absolute;top:23px;left:0;right:0;height:5px;background:var(--rz);border-radius:3px;}
+.rmap .risk{position:absolute;top:23px;height:5px;background:rgba(224,96,95,.55);}
+.rmap .rew{position:absolute;top:23px;height:5px;background:rgba(47,191,143,.5);}
+.rmap .mk{position:absolute;top:12px;width:2px;height:27px;background:var(--dm);}
+.rmap .mk.e{background:var(--gd);height:33px;top:9px;}
+.rmap .lb{position:absolute;top:42px;font-size:.62rem;color:var(--dm);transform:translateX(-50%);
+          white-space:nowrap;}
+.rmap .lb.e{color:var(--gd);}
+
 @media(max-width:640px){.block-container{padding-left:.6rem;padding-right:.6rem;}
-  .status{gap:.9rem;} .kpi div{min-width:88px;}}
+  .status{gap:.9rem;} .kpi div{min-width:88px;} .dh .sym{font-size:1.7rem;}
+  .fn .nm{width:104px;font-size:.66rem;}}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -142,12 +180,12 @@ SE MELI GRAB CPNG STNE PAGS VIST GGAL BMA PAM YPF TS TX
 """.split()
 
 PRESETS = {
-    "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", price=10.0, sh=1.0, atr=1.0,
-                       atrp=2.0, rise=12, age=(3, 35), retr=(20, 70), rr=1.5),
-    "רחב": dict(dry=1.10, bb="כבוי", price=5.0, sh=0.5, atr=0.5, atrp=1.5,
-                rise=8, age=(2, 45), retr=(15, 80), rr=1.0),
-    "מחמיר": dict(dry=1.45, bb="אחת מהשתיים", price=15.0, sh=2.0, atr=1.5, atrp=3.0,
-                  rise=20, age=(5, 20), retr=(30, 62), rr=2.0),
+    "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", bbmode="בונוס", price=10.0, dv=15.0,
+                       sh=0.3, atr=1.0, atrp=2.0, rise=12, age=(3, 45), retr=(20, 70), rr=1.5),
+    "רחב": dict(dry=1.10, bb="אחת מהשתיים", bbmode="בונוס", price=5.0, dv=8.0, sh=0.2,
+                atr=0.4, atrp=1.5, rise=8, age=(2, 60), retr=(15, 85), rr=1.0),
+    "מחמיר": dict(dry=1.45, bb="רצועה תחתונה", bbmode="חובה", price=15.0, dv=40.0, sh=1.0,
+                  atr=1.5, atrp=3.0, rise=20, age=(3, 25), retr=(30, 65), rr=2.0),
 }
 
 
@@ -233,7 +271,7 @@ def core(A, i, C):
     c, o, h, l, v = A["c"], A["o"], A["h"], A["l"], A["v"]
     if i < 80:
         return None, "היסטוריה קצרה"
-    s = max(0, i - 109)
+    s = max(0, i - C["win"] + 1)
     cw, ow, lw, vw = c[s:i + 1], o[s:i + 1], l[s:i + 1], v[s:i + 1]
     n = len(cw)
     peak = int(np.argmax(cw[:-1]))
@@ -272,7 +310,7 @@ def core(A, i, C):
     tags = []
     if C["bb"] != "off":
         tags = bb_hits(A, i, C["bb_look"], C["bb"])
-        if not tags:
+        if C["bb_hard"] and not tags:
             return None, "אין נר על בולינג׳ר"
     sup = float(lw[peak:].min())
     a = float(A["atr"][i])
@@ -355,6 +393,54 @@ def card(r, best=False):
 <div class="tw">{r['why']}</div></div>"""
 
 
+def funnel_html(total, drop):
+    order = ["מחזור נמוך", "נפח מניות נמוך", "מחיר נמוך", "השיא ישן מדי", "עוד בשיא",
+             "זינוק קטן מדי", "זינוק קצר מדי", "אין מקום לזינוק", "כמעט לא תיקנה",
+             "החזירה את כל הזינוק", "הנפח לא התייבש", "אין נר בולינג׳ר",
+             "ATR נמוך מדי", "תנודתיות נמוכה", "אין מרווח ל-TP1", "היסטוריה קצרה",
+             "אין נתוני נפח", "סטופ לא תקין", "אין ATR", "שגיאה"]
+    items = [(k, drop[k]) for k in order if drop.get(k)]
+    items += [(k, v) for k, v in drop.items() if k not in order and v]
+    mx = max([v for _, v in items], default=1)
+    rows = ""
+    for k, v in items:
+        rows += (f'<div class="row"><div class="nm">{k}</div><div class="tr">'
+                 f'<div class="fl cut" style="width:{v/mx*100:.1f}%"></div></div>'
+                 f'<div class="vl">{v:,}</div></div>')
+    return f'<div class="fn">{rows}</div>'
+
+
+def stat_grid(items):
+    cells = "".join(f'<div class="{c}"><b>{v}</b><span>{lab}</span></div>'
+                    for lab, v, c in items)
+    return f'<div class="sg">{cells}</div>'
+
+
+def rmap(r):
+    """Trade laid out in R multiples from stop to TP3."""
+    risk = r["entry"] - r["stop"]
+    if risk <= 0:
+        return ""
+    lo_r, hi_r = -1.0, (r["tp3"] - r["entry"]) / risk
+    span = hi_r - lo_r
+    def pos(x):
+        return (x - lo_r) / span * 100
+    e, t1 = pos(0), pos((r["tp1"] - r["entry"]) / risk)
+    t2, t3 = pos((r["tp2"] - r["entry"]) / risk), pos(hi_r)
+    h = (f'<div class="rmap"><div class="base"></div>'
+         f'<div class="risk" style="left:0;width:{e:.1f}%"></div>'
+         f'<div class="rew" style="left:{e:.1f}%;width:{t3-e:.1f}%"></div>'
+         f'<div class="mk" style="left:0"></div><div class="lb" style="left:2%">סטופ −1R</div>'
+         f'<div class="mk e" style="left:{e:.1f}%"></div>'
+         f'<div class="lb e" style="left:{e:.1f}%">כניסה</div>')
+    for x, lab in [(t1, f"TP1 +{(r['tp1']-r['entry'])/risk:.1f}R"),
+                   (t2, f"TP2 +{(r['tp2']-r['entry'])/risk:.1f}R"),
+                   (t3, f"TP3 +{hi_r:.1f}R")]:
+        h += (f'<div class="mk" style="left:{x:.1f}%"></div>'
+              f'<div class="lb" style="left:{min(x,96):.1f}%">{lab}</div>')
+    return h + "</div>"
+
+
 # ---------------------------------------------------------------- top bar
 
 il = timezone(timedelta(hours=3))
@@ -380,20 +466,21 @@ for col, name in zip((p1, p2, p3), PRESETS):
         st.rerun()
 P = st.session_state["P"]
 
-f1, f2, f3, f4, f5, f6 = st.columns([1.1, 1.1, 1.1, 1, 1, 1.3])
+f1, f2, f3, f4, f5, f6 = st.columns([1.05, 1.15, 1, 1.15, 1, 1.35])
 dry_min = f1.number_input("יובש נפח מינ׳", 0.5, 3.0, float(P["dry"]), 0.05)
 bb_lbl = f2.selectbox("נר בולינג׳ר", ["כבוי", "רצועה תחתונה", "רצועה עליונה", "אחת מהשתיים"],
                       index=["כבוי", "רצועה תחתונה", "רצועה עליונה",
                              "אחת מהשתיים"].index(P["bb"]))
 min_px = f3.number_input("מחיר מינ׳ $", 1.0, 500.0, float(P["price"]), 1.0)
-min_sh = f4.number_input("נפח מינ׳ (מ׳)", 0.1, 50.0, float(P["sh"]), 0.1)
+min_dv = f4.number_input("מחזור מינ׳ (מ׳ $)", 1.0, 500.0, float(P["dv"]), 1.0,
+                         help="מחזור בדולרים, לא במניות. זה המדד הנכון לנזילות.")
 atr_abs = f5.number_input("ATR מינ׳ $", 0.0, 20.0, float(P["atr"]), 0.1)
 f6.markdown("<div style='height:1.55rem'></div>", unsafe_allow_html=True)
 go_ = f6.button("סרוק את השוק", type="primary", use_container_width=True)
 
 with st.expander("סינון מתקדם"):
     g1, g2, g3, g4 = st.columns(4)
-    agev = g1.slider("ימים מהשיא", 1, 60, tuple(P["age"]))
+    agev = g1.slider("ימים מהשיא", 1, 90, tuple(P["age"]))
     retr = g2.slider("עומק תיקון %", 5, 95, tuple(P["retr"]))
     rise_min = g3.slider("גודל זינוק מינ׳ %", 3, 100, int(P["rise"]))
     atr_pct = g4.slider("ATR מינ׳ %", 0.0, 10.0, float(P["atrp"]), 0.25)
@@ -401,15 +488,24 @@ with st.expander("סינון מתקדם"):
     leg_min = h1.slider("ימי זינוק מינ׳", 3, 20, 5)
     leg_max = h2.slider("ימי זינוק מקס׳", 8, 60, 30)
     rr_min = h3.slider("יחס סיכון־סיכוי", 0.5, 5.0, float(P["rr"]), 0.1)
-    bb_look = h4.slider("בולינג׳ר: כמה ימים אחורה", 1, 10, 3)
-    i1, i2, i3 = st.columns(3)
-    limit = i1.slider("מספר מניות לסריקה", 200, 2500, 1500, 100)
-    acct = i2.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
-    riskp = i3.slider("סיכון לעסקה %", 0.25, 5.0, 0.5, 0.25)
+    min_sh = h4.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P["sh"]), 0.1,
+                             help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
+    j1, j2, j3, j4 = st.columns(4)
+    bbmode = j1.selectbox("בולינג׳ר כ־", ["בונוס", "חובה"],
+                          index=["בונוס", "חובה"].index(P.get("bbmode", "בונוס")),
+                          help="בונוס = מסומן בתווית אך לא פוסל. חובה = מסנן.")
+    bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
+    win = j3.slider("חלון חיפוש השיא (ימים)", 60, 200, 110, 10,
+                    help="ככל שהחלון גדול יותר, כך 'השיא ישן מדי' פוסל יותר.")
+    limit = j4.slider("מספר מניות לסריקה", 200, 2500, 1500, 100)
+    k1, k2 = st.columns(2)
+    acct = k1.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
+    riskp = k2.slider("סיכון לעסקה %", 0.25, 5.0, 0.5, 0.25)
 
 C = dict(leg_min=leg_min, leg_max=leg_max, rise_min=rise_min, retr_lo=retr[0],
          retr_hi=retr[1], age_lo=agev[0], age_hi=agev[1], atr_pct=atr_pct,
-         atr_abs=atr_abs, rr_min=rr_min, dry_min=dry_min, bb_look=bb_look,
+         atr_abs=atr_abs, rr_min=rr_min, dry_min=dry_min, bb_look=bb_look, win=win,
+         bb_hard=(bbmode == "חובה"),
          bb={"כבוי": "off", "רצועה תחתונה": "lower",
              "רצועה עליונה": "upper", "אחת מהשתיים": "both"}[bb_lbl])
 
@@ -421,56 +517,153 @@ if st.session_state.get("open"):
     if r is None:
         st.session_state["open"] = None
         st.rerun()
-    if st.button("→  חזרה לרשימה"):
+
+    nav1, nav2 = st.columns([1, 4])
+    if nav1.button("→  חזרה לרשימה", use_container_width=True):
         st.session_state["open"] = None
         st.rerun()
-    st.markdown(f"### {r['ticker']}")
-    st.markdown(f'<div class="tw" style="font-size:.88rem">{r["why"]}</div>',
+    others = [x["ticker"] for x in st.session_state["rows"]]
+    jump = nav2.selectbox("מעבר מהיר", others, index=others.index(r["ticker"]),
+                          label_visibility="collapsed")
+    if jump != r["ticker"]:
+        st.session_state["open"] = jump
+        st.rerun()
+
+    d1 = fetch((r["ticker"],), period="2y").get(r["ticker"])
+    chg = chgp = 0.0
+    if d1 is not None and len(d1) > 1:
+        chg = float(d1["Close"].iloc[-1] - d1["Close"].iloc[-2])
+        chgp = chg / float(d1["Close"].iloc[-2]) * 100
+    cls = "up" if chg >= 0 else "dn"
+    st.markdown(f"""<div class="dh">
+<div><div class="sym">{r['ticker']}</div></div>
+<div style="text-align:left;direction:ltr">
+  <div class="pr">${r['price']:.2f}</div>
+  <div class="ch {cls}">{chg:+.2f}  ({chgp:+.2f}%)</div>
+</div></div>""", unsafe_allow_html=True)
+
+    st.markdown(stat_grid([
+        ("יובש נפח", f"{r['dry']:.2f}×", "gd"),
+        ("נפח בזינוק", f"{r['spike']:.2f}×", ""),
+        ("זינוק", f"+{r['rise']:.0f}%", "up"),
+        ("ימי זינוק", f"{r['leg_bars']}", ""),
+        ("תיקון", f"{r['retrace']:.0f}%", ""),
+        ("ימים מהשיא", f"{r['age']}", ""),
+        ("ATR", f"${r['atr']:.2f}", ""),
+        ("ATR %", f"{r['atr_pct']:.1f}%", ""),
+        ("RVOL", f"{r['rvol']:.2f}", ""),
+        ("R:R ל-TP1", f"1:{r['rr']:.1f}", "gd"),
+        ("R:R ל-TP3", f"1:{r['rr3']:.1f}", ""),
+        ("בולינג׳ר", ", ".join(r.get("bb", [])) or "—", ""),
+    ]), unsafe_allow_html=True)
+
+    st.markdown(f'<div class="tw" style="font-size:.86rem">{r["why"]}</div>',
                 unsafe_allow_html=True)
-    d1 = fetch((r["ticker"],)).get(r["ticker"])
+
+    c1, c2, c3 = st.columns([1, 2, 1])
+    per = c1.selectbox("טווח", ["3 חודשים", "6 חודשים", "שנה", "שנתיים"], index=1)
+    ind = c2.multiselect("אינדיקטורים", ["בולינג׳ר", "SMA20", "SMA50", "SMA200",
+                                         "רמות עסקה", "אזורי תבנית"],
+                         default=["בולינג׳ר", "SMA20", "SMA50", "רמות עסקה", "אזורי תבנית"])
+    show_rsi = c3.checkbox("פאנל RSI", value=True)
+
+    bars = {"3 חודשים": 63, "6 חודשים": 126, "שנה": 252, "שנתיים": 504}[per]
+
     if d1 is not None:
-        v = d1.tail(120)
-        mid, sd = v["Close"].rolling(20).mean(), v["Close"].rolling(20).std()
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            row_heights=[.76, .24], vertical_spacing=.02)
-        fig.add_trace(go.Scatter(x=v.index, y=mid + 2 * sd, line=dict(color="#33505E", width=1),
-                                 showlegend=False), 1, 1)
-        fig.add_trace(go.Scatter(x=v.index, y=mid - 2 * sd, line=dict(color="#33505E", width=1),
-                                 fill="tonexty", fillcolor="rgba(51,80,94,.13)",
-                                 showlegend=False), 1, 1)
+        v = d1.tail(bars)
+        rows_n = 3 if show_rsi else 2
+        heights = [.62, .19, .19] if show_rsi else [.78, .22]
+        fig = make_subplots(rows=rows_n, cols=1, shared_xaxes=True,
+                            row_heights=heights, vertical_spacing=.02)
+        if "בולינג׳ר" in ind:
+            mid, sd = v["Close"].rolling(20).mean(), v["Close"].rolling(20).std()
+            fig.add_trace(go.Scatter(x=v.index, y=mid + 2 * sd, line=dict(color="#33505E", width=1),
+                                     showlegend=False, hoverinfo="skip"), 1, 1)
+            fig.add_trace(go.Scatter(x=v.index, y=mid - 2 * sd, line=dict(color="#33505E", width=1),
+                                     fill="tonexty", fillcolor="rgba(51,80,94,.13)",
+                                     showlegend=False, hoverinfo="skip"), 1, 1)
         fig.add_trace(go.Candlestick(x=v.index, open=v.Open, high=v.High, low=v.Low,
-                                     close=v.Close, name="",
+                                     close=v.Close, name=r["ticker"],
                                      increasing_line_color="#2FBF8F",
                                      decreasing_line_color="#E0605F",
                                      increasing_fillcolor="#2FBF8F",
                                      decreasing_fillcolor="#E0605F"), 1, 1)
-        for y_, lab, col, dash in [(r["entry"], "כניסה", "#D4A64B", "solid"),
-                                   (r["stop"], "סטופ", "#E0605F", "dash"),
-                                   (r["tp1"], "TP1", "#2FBF8F", "dot"),
-                                   (r["tp2"], "TP2", "#2FBF8F", "dot"),
-                                   (r["tp3"], "TP3", "#2FBF8F", "dot")]:
-            fig.add_hline(y=y_, line_dash=dash, line_color=col, line_width=1,
-                          annotation_text=f"{lab} {y_:.2f}", annotation_position="right",
-                          annotation_font_size=11, annotation_font_color=col, row=1, col=1)
+        for nm, per_, col in [("SMA20", 20, "#4E8FB0"), ("SMA50", 50, "#D4A64B"),
+                              ("SMA200", 200, "#8A6FB0")]:
+            if nm in ind:
+                fig.add_trace(go.Scatter(x=v.index, y=v["Close"].rolling(per_).mean(),
+                                         line=dict(color=col, width=1), name=nm), 1, 1)
+        if "אזורי תבנית" in ind:
+            try:
+                pk = d1.index[-1 - r["age"]]
+                lg = d1.index[-1 - r["age"] - r["leg_bars"]]
+                if lg >= v.index[0]:
+                    fig.add_vrect(x0=lg, x1=pk, fillcolor="#2FBF8F", opacity=.07,
+                                  line_width=0, row=1, col=1)
+                if pk >= v.index[0]:
+                    fig.add_vrect(x0=pk, x1=v.index[-1], fillcolor="#E0605F", opacity=.07,
+                                  line_width=0, row=1, col=1)
+            except Exception:
+                pass
+        if "רמות עסקה" in ind:
+            for y_, lab, col, dash in [(r["entry"], "כניסה", "#D4A64B", "solid"),
+                                       (r["stop"], "סטופ", "#E0605F", "dash"),
+                                       (r["support"], "תמיכה", "#6C8896", "dot"),
+                                       (r["tp1"], "TP1", "#2FBF8F", "dot"),
+                                       (r["tp2"], "TP2", "#2FBF8F", "dot"),
+                                       (r["tp3"], "TP3", "#2FBF8F", "dot")]:
+                fig.add_hline(y=y_, line_dash=dash, line_color=col, line_width=1,
+                              annotation_text=f"{lab} {y_:.2f}", annotation_position="right",
+                              annotation_font_size=10, annotation_font_color=col, row=1, col=1)
         vc = ["#2FBF8F" if x >= y2 else "#E0605F" for x, y2 in zip(v.Close, v.Open)]
         fig.add_trace(go.Bar(x=v.index, y=v.Volume, marker_color=vc, marker_line_width=0,
-                             opacity=.5, showlegend=False), 2, 1)
-        fig.update_layout(height=580, showlegend=False, xaxis_rangeslider_visible=False,
-                          font_family="Heebo", font_color="#93A8B2",
+                             opacity=.5, name="נפח", showlegend=False), 2, 1)
+        fig.add_trace(go.Scatter(x=v.index, y=v["Volume"].rolling(20).mean(),
+                                 line=dict(color="#93A8B2", width=1), showlegend=False,
+                                 hoverinfo="skip"), 2, 1)
+        if show_rsi:
+            dl = v["Close"].diff()
+            up = dl.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+            dn = (-dl.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+            rsi_v = 100 - 100 / (1 + up / dn.replace(0, np.nan))
+            fig.add_trace(go.Scatter(x=v.index, y=rsi_v, line=dict(color="#D4A64B", width=1.2),
+                                     showlegend=False), 3, 1)
+            for lvl, cl in [(70, "#E0605F"), (30, "#2FBF8F"), (50, "#2A3D47")]:
+                fig.add_hline(y=lvl, line_color=cl, line_width=.8, line_dash="dot", row=3, col=1)
+            fig.update_yaxes(range=[0, 100], row=3, col=1)
+        fig.update_layout(height=700 if show_rsi else 580, xaxis_rangeslider_visible=False,
+                          font_family="Heebo", font_color="#93A8B2", hovermode="x unified",
                           paper_bgcolor="#0B1216", plot_bgcolor="#0B1216",
-                          margin=dict(l=8, r=90, t=14, b=8))
-        fig.update_xaxes(showgrid=False, linecolor="#22333C")
+                          legend=dict(orientation="h", y=1.03, x=0, bgcolor="rgba(0,0,0,0)",
+                                      font=dict(size=10)),
+                          margin=dict(l=8, r=92, t=26, b=8))
+        fig.update_xaxes(showgrid=False, linecolor="#22333C", rangeslider_visible=False)
         fig.update_yaxes(gridcolor="#17242B", zeroline=False, linecolor="#22333C")
         st.plotly_chart(fig, use_container_width=True)
-    m = st.columns(4)
-    m[0].metric("יובש נפח", f"{r['dry']}×")
-    m[1].metric("יחס סיכון־סיכוי", f"1:{r['rr']}")
-    m[2].metric("ATR", f"${r['atr']}")
-    m[3].metric("מרחק להפעלה", f"{r['to_entry']:+.1f}%")
-    st.code(f"{r['ticker']}\n"
-            f"BUY STOP {int(r['shares'])} @ {r['entry']:.2f}\n"
-            f"STOP {r['stop']:.2f}   (סיכון ${r['risk_total']:.0f})\n"
-            f"TP1 {r['tp1']:.2f} · TP2 {r['tp2']:.2f} · TP3 {r['tp3']:.2f}", language=None)
+
+    st.markdown("### מפת הסיכון")
+    st.markdown(rmap(r), unsafe_allow_html=True)
+
+    q1, q2 = st.columns([1, 1])
+    with q1:
+        st.markdown("##### תוכנית מסחר")
+        st.code(f"{r['ticker']}\n"
+                f"BUY STOP {int(r['shares'])} @ {r['entry']:.2f}\n"
+                f"STOP {r['stop']:.2f}\n"
+                f"TP1 {r['tp1']:.2f}  ·  TP2 {r['tp2']:.2f}  ·  TP3 {r['tp3']:.2f}",
+                language=None)
+    with q2:
+        st.markdown("##### כסף")
+        st.markdown(stat_grid([
+            ("כמות מניות", f"{int(r['shares']):,}", ""),
+            ("שווי פוזיציה", f"${r['shares']*r['entry']:,.0f}", ""),
+            ("סיכון", f"${r['risk_total']:,.0f}", "dn"),
+            ("רווח ב-TP1", f"${r['shares']*(r['tp1']-r['entry']):,.0f}", "up"),
+            ("רווח ב-TP3", f"${r['shares']*(r['tp3']-r['entry']):,.0f}", "up"),
+            ("סיכון למניה", f"${r['risk_share']:.2f}", ""),
+        ]), unsafe_allow_html=True)
+
+    st.caption("הכניסה היא הוראת BUY STOP מעל שיא היום. אם המחיר לא מגיע לשם — אין עסקה.")
     st.stop()
 
 # ---------------------------------------------------------------- scan
@@ -488,8 +681,12 @@ if go_:
                 if p < min_px:
                     drop["מחיר נמוך"] = drop.get("מחיר נמוך", 0) + 1
                     continue
-                if float(d["Volume"].tail(20).mean()) < min_sh * 1e6:
-                    drop["נפח נמוך"] = drop.get("נפח נמוך", 0) + 1
+                avg_sh = float(d["Volume"].tail(20).mean())
+                if p * avg_sh < min_dv * 1e6:
+                    drop["מחזור נמוך"] = drop.get("מחזור נמוך", 0) + 1
+                    continue
+                if min_sh > 0 and avg_sh < min_sh * 1e6:
+                    drop["נפח מניות נמוך"] = drop.get("נפח מניות נמוך", 0) + 1
                     continue
                 liq += 1
                 A = prep(d)
@@ -532,10 +729,9 @@ else:
         st.markdown('<div class="empty">אין מניות בתבנית בסינון הזה.<br>'
                     'התבנית נדירה — נסה את הפריסט הרחב לפני שאתה מרפה ידנית.</div>',
                     unsafe_allow_html=True)
-        with st.expander("מה נפסל"):
-            st.dataframe(pd.DataFrame(sorted(st.session_state["drop"].items(),
-                                             key=lambda x: -x[1]), columns=["סיבה", "כמות"]),
-                         hide_index=True, use_container_width=True)
+        with st.expander("מפל הסינון — איפה המניות נפלו", expanded=True):
+            st.markdown(funnel_html(u, st.session_state["drop"]), unsafe_allow_html=True)
+            st.caption("השורה הארוכה ביותר היא המסנן שחוסם הכי הרבה. הרפה אותו ראשון.")
     else:
         view = st.radio("תצוגה", ["כרטיסים", "טבלה"], horizontal=True,
                         label_visibility="collapsed")
@@ -574,6 +770,9 @@ else:
                                      use_container_width=True):
                             st.session_state["open"] = r["ticker"]
                             st.rerun()
+
+        with st.expander("מפל הסינון — איפה המניות נפלו"):
+            st.markdown(funnel_html(u, st.session_state["drop"]), unsafe_allow_html=True)
 
         df = pd.DataFrame([{k: v for k, v in r.items() if k != "spark"} for r in rows])
         z1, z2 = st.columns(2)

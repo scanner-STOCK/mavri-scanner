@@ -390,6 +390,26 @@ def core(A, i, C):
                 bb=tags, spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
 
 
+def ltr(txt):
+    """Wrap a numeric/LTR fragment so it doesn't get reordered inside RTL text."""
+    return f'<bdi dir="ltr">{txt}</bdi>'
+
+
+def day_trade_plan(r):
+    """Tight ATR-based plan for a max-4-day hold, separate from the swing TP1/2/3."""
+    a = r["atr"]
+    entry = r["entry"]
+    stop = round(entry - 1.7 * a, 2)
+    t1 = round(entry + 1.0 * a, 2)
+    t2 = round(entry + 2.0 * a, 2)
+    t3 = round(entry + 3.2 * a, 2)
+    risk = entry - stop
+    return dict(entry=entry, stop=stop, t1=t1, t2=t2, t3=t3, risk=round(risk, 2),
+                rr1=round((t1 - entry) / risk, 2) if risk > 0 else 0,
+                rr2=round((t2 - entry) / risk, 2) if risk > 0 else 0,
+                rr3=round((t3 - entry) / risk, 2) if risk > 0 else 0)
+
+
 def why_he(r):
     return (f"עלתה {r['rise']:.0f}% ב-{r['leg_bars']} ימים בנפח פי {r['spike']:.1f}, "
             f"תיקנה {r['retrace']:.0f}% בנפח קטן פי {r['dry']:.2f}, "
@@ -426,23 +446,31 @@ def ladder(r):
     return f'<div class="lad">{html}</div>'
 
 
-def card(r, best=False, watched=False):
+def card(r, best=False, watched=False, triggered=False, aging=False):
     ch = "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
     ch += f'<span class="chip">ATR {r["atr"]:.2f}$</span><span class="chip">RVOL {r["rvol"]:.2f}</span>'
     near = r["to_entry"] <= 1.0
-    if near:
-        ch = '<span class="badge">קרוב להפעלה</span>' + ch
+    badges = ""
     if watched:
-        ch = '<span class="badge" style="background:rgba(212,166,75,.18);color:var(--gd)">'\
-             '★ ברשימת מעקב</span>' + ch
-    return f"""<div class="tc{' top' if best else ''}{' near' if near else ''}">
+        badges += ('<span class="badge" style="background:rgba(212,166,75,.18);'
+                   'color:var(--gd)">★ ברשימת מעקב</span>')
+    if triggered:
+        badges += ('<span class="badge" style="background:rgba(224,96,95,.16);'
+                   'color:var(--sh)">כבר הופעל</span>')
+    elif near:
+        badges += '<span class="badge">קרוב להפעלה</span>'
+    if aging:
+        badges += ('<span class="badge" style="background:rgba(212,166,75,.12);'
+                   'color:#B98C3E">תבנית מתיישנת</span>')
+    ch = badges + ch
+    return f"""<div class="tc{' top' if best else ''}{' near' if near and not triggered else ''}">
 <div class="tc-h"><div class="tc-s">{r['ticker']}</div>
 <div class="tc-d"><b>{r['dry']:.2f}×</b><span>יובש נפח</span></div></div>
 {sparkline(r.get('spark', []))}<div class="chips">{ch}</div>{ladder(r)}
 <div class="tl"><span>{int(r['shares'])} מניות · סיכון <b>${r['risk_total']:.0f}</b></span>
 <span>יחס <b>1:{r['rr']:.1f}</b></span></div>
 <div class="tl" style="border:0;padding-top:.22rem"><span>{r['age']} ימים מהשיא</span>
-<span>הפעלה ב-<b>{r['to_entry']:+.1f}%</b></span></div>
+<span>הפעלה ב-<b>{ltr(f"{r['to_entry']:+.1f}%")}</b></span></div>
 <div class="tw">{r['why']}</div></div>"""
 
 
@@ -511,31 +539,35 @@ def wl_toggle(r):
 
 def wl_status(item, d):
     """Where the trade stands, using daily bars since it was saved."""
+    pct_live = 0.0
     if d is None or len(d) == 0:
-        return dict(state="אין נתונים", cls="", px=0.0, r=0.0, note="")
+        return dict(state="אין נתונים", cls="", px=0.0, r=0.0, pct=0.0, note="")
     px = float(d["Close"].iloc[-1])
+    pct_live = (px / item["entry"] - 1) * 100
     w = d.tail(15)
     hi, lo = w["High"].values, w["Low"].values
     risk = item["entry"] - item["stop"]
     trig_i = next((k for k in range(len(hi)) if hi[k] >= item["entry"]), None)
     if trig_i is None:
         dist = (item["entry"] / px - 1) * 100
-        return dict(state="ממתין", cls="wait", px=px, r=0.0,
-                    note=f"{dist:+.1f}% עד ההפעלה")
+        return dict(state="ממתין", cls="wait", px=px, r=0.0, pct=pct_live,
+                    note=f'עד ההפעלה {ltr(f"{dist:+.1f}%")}')
     after_lo, after_hi = lo[trig_i:], hi[trig_i:]
     if after_lo.min() <= item["stop"]:
-        return dict(state="נפגע סטופ", cls="bad", px=px, r=-1.0, note="העסקה נסגרה בהפסד")
+        return dict(state="נפגע סטופ", cls="bad", px=px, r=-1.0, pct=pct_live,
+                    note="העסקה נסגרה בהפסד")
     if after_hi.max() >= item["tp3"]:
-        return dict(state="TP3 הושג", cls="good", px=px,
+        return dict(state="TP3 הושג", cls="good", px=px, pct=pct_live,
                     r=(item["tp3"] - item["entry"]) / risk, note="העסקה מוצתה")
     if after_hi.max() >= item["tp2"]:
-        return dict(state="TP2 הושג", cls="good", px=px,
+        return dict(state="TP2 הושג", cls="good", px=px, pct=pct_live,
                     r=(px - item["entry"]) / risk, note="להזיז סטופ לכניסה")
     if after_hi.max() >= item["tp1"]:
-        return dict(state="TP1 הושג", cls="good", px=px,
+        return dict(state="TP1 הושג", cls="good", px=px, pct=pct_live,
                     r=(px - item["entry"]) / risk, note="למכור שליש, סטופ לכניסה")
-    return dict(state="בפוזיציה", cls="live", px=px, r=(px - item["entry"]) / risk,
-                note=f"{(item['tp1']/px-1)*100:+.1f}% עד TP1")
+    return dict(state="בפוזיציה", cls="live", px=px, pct=pct_live,
+                r=(px - item["entry"]) / risk,
+                note=f'עד TP1 {ltr(f"{(item["tp1"]/px-1)*100:+.1f}%")}')
 
 
 def funnel_html(total, drop):
@@ -677,11 +709,13 @@ def render_watchlist():
 
     for item, st_ in active:
         r_cls = "z" if abs(st_["r"]) < .05 else ("p" if st_["r"] > 0 else "n")
+        pct_cls = "z" if abs(st_["pct"]) < .05 else ("p" if st_["pct"] > 0 else "n")
         st.markdown(f"""<div class="wl-row {st_['cls']}">
 <div class="wl-sym">{item['ticker']}</div>
 <div class="wl-st {st_['cls']}">{st_['state']}</div>
 <div class="wl-px">${st_['px']:.2f}</div>
-<div class="wl-r {r_cls}">{st_['r']:+.2f}R</div>
+<div class="wl-r {pct_cls}">{ltr(f"{st_['pct']:+.1f}%")}<span style="color:var(--dm);font-size:.62rem"> מהכניסה</span></div>
+<div class="wl-r {r_cls}">{ltr(f"{st_['r']:+.2f}R")}</div>
 <div class="wl-note">{st_['note']}</div>
 </div>""", unsafe_allow_html=True)
         b1, b2 = st.columns([1, 6])
@@ -697,7 +731,7 @@ def render_watchlist():
 <div class="wl-sym">{item['ticker']}</div>
 <div class="wl-st {st_['cls']}">{st_['state']}</div>
 <div class="wl-px">${st_['px']:.2f}</div>
-<div class="wl-r {r_cls}">{st_['r']:+.2f}R</div>
+<div class="wl-r {r_cls}">{ltr(f"{st_['r']:+.2f}R")}</div>
 <div class="wl-note">{st_['note']}</div></div>""", unsafe_allow_html=True)
             if st.button("נקה עסקאות שנסגרו"):
                 keep = {i["ticker"] for i, s_ in active}
@@ -840,19 +874,48 @@ if st.session_state.get("open"):
         st.caption("גלגלת העכבר מקרבת ומרחיקה · גרירה מזיזה · לחיצה כפולה מאפסת · "
                    "בנייד צביטה שתי אצבעות")
 
-    st.markdown("### מפת הסיכון")
+    st.markdown("### אסטרטגיית סוחר יומי — עד 4 ימי מסחר")
+    dtp = day_trade_plan(r)
+    dt_shares = int((acct * riskp / 100) / dtp["risk"]) if dtp["risk"] > 0 else 0
+    st.markdown(stat_grid([
+        ("כניסה", f"${dtp['entry']:.2f}", "gd"),
+        ("סטופ צר", f"${dtp['stop']:.2f}", "dn"),
+        ("סיכון למניה", f"${dtp['risk']:.2f}", ""),
+        ("T1 (יום 1-2)", f"${dtp['t1']:.2f}", "up"),
+        ("T2 (יום 2-3)", f"${dtp['t2']:.2f}", "up"),
+        ("T3 (יום 3-4)", f"${dtp['t3']:.2f}", "up"),
+        ("R:R ל-T1", f"1:{dtp['rr1']:.1f}", ""),
+        ("R:R ל-T2", f"1:{dtp['rr2']:.1f}", ""),
+        ("R:R ל-T3", f"1:{dtp['rr3']:.1f}", ""),
+        ("כמות מניות", f"{dt_shares:,}", ""),
+    ]), unsafe_allow_html=True)
+    st.markdown(f"""<div class="tw" style="font-size:.82rem;line-height:1.85">
+<b style="color:var(--tx)">יום 1</b> — ממתינים להפעלה: פריצה מעל {ltr(f"${dtp['entry']:.2f}")} בנפח מוגבר. לא הופעל? לא נוגעים.<br>
+<b style="color:var(--tx)">יום 1–2</b> — לאחר הפעלה, סטופ קבוע ב-{ltr(f"${dtp['stop']:.2f}")}. הגעה ל-T1 → מוכרים שליש, מעלים סטופ לכניסה.<br>
+<b style="color:var(--tx)">יום 2–3</b> — הגעה ל-T2 → מוכרים שליש נוסף, סטופ עוקב מתחת לשפל היום הקודם.<br>
+<b style="color:var(--tx)">יום 3–4</b> — יתרה ל-T3 או יציאה ידנית. <span style="color:var(--sh)">לא הופעל תוך 4 ימי מסחר → מבטלים את ההגדרה, התבנית נחשבת שהתיישנה.</span>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("### מפת הסיכון — עסקת סווינג המלאה")
     st.markdown(rmap(r), unsafe_allow_html=True)
 
     q1, q2 = st.columns([1, 1])
     with q1:
-        st.markdown("##### תוכנית מסחר")
+        st.markdown("##### תוכנית סווינג (TP1–TP3 מלאים)")
         st.code(f"{r['ticker']}\n"
                 f"BUY STOP {int(r['shares'])} @ {r['entry']:.2f}\n"
                 f"STOP {r['stop']:.2f}\n"
                 f"TP1 {r['tp1']:.2f}  ·  TP2 {r['tp2']:.2f}  ·  TP3 {r['tp3']:.2f}",
                 language=None)
+        st.markdown("##### תוכנית יום (4 ימים)")
+        st.code(f"{r['ticker']}\n"
+                f"BUY STOP {dt_shares} @ {dtp['entry']:.2f}\n"
+                f"STOP {dtp['stop']:.2f}\n"
+                f"T1 {dtp['t1']:.2f}  ·  T2 {dtp['t2']:.2f}  ·  T3 {dtp['t3']:.2f}\n"
+                f"בטל אם לא הופעל תוך 4 ימי מסחר",
+                language=None)
     with q2:
-        st.markdown("##### כסף")
+        st.markdown("##### כסף — סווינג")
         st.markdown(stat_grid([
             ("כמות מניות", f"{int(r['shares']):,}", ""),
             ("שווי פוזיציה", f"${r['shares']*r['entry']:,.0f}", ""),
@@ -861,8 +924,16 @@ if st.session_state.get("open"):
             ("רווח ב-TP3", f"${r['shares']*(r['tp3']-r['entry']):,.0f}", "up"),
             ("סיכון למניה", f"${r['risk_share']:.2f}", ""),
         ]), unsafe_allow_html=True)
+        st.markdown("##### כסף — 4 ימים")
+        st.markdown(stat_grid([
+            ("כמות מניות", f"{dt_shares:,}", ""),
+            ("סיכון", f"${round(dt_shares*dtp['risk']):,}", "dn"),
+            ("רווח ב-T1", f"${round(dt_shares*(dtp['t1']-dtp['entry'])):,}", "up"),
+            ("רווח ב-T3", f"${round(dt_shares*(dtp['t3']-dtp['entry'])):,}", "up"),
+        ]), unsafe_allow_html=True)
 
-    st.caption("הכניסה היא הוראת BUY STOP מעל שיא היום. אם המחיר לא מגיע לשם — אין עסקה.")
+    st.caption("שתי התוכניות משתמשות באותה נקודת כניסה. ההבדל הוא מרחק הסטופ והיעדים — "
+               "התוכנית היומית מהודקת ל-ATR כדי להתאים לטווח זמן של ימים ולא שבועות.")
     st.stop()
 
 # ---------------------------------------------------------------- scan
@@ -1003,12 +1074,19 @@ else:
                 st.rerun()
         else:
             wl_tickers = {x["ticker"] for x in wl_load()}
+            live_now = live(tuple(r["ticker"] for r in rows))
+            age_ceiling = C["age_hi"]
             for start in range(0, len(rows), 3):
                 cols = st.columns(3, gap="medium")
                 for col, r in zip(cols, rows[start:start + 3]):
                     with col:
+                        lp = live_now.get(r["ticker"])
+                        cur_px = float(lp["Close"].iloc[-1]) if lp is not None and len(lp) else r["price"]
+                        triggered = cur_px >= r["entry"]
+                        aging = (age_ceiling - r["age"]) <= 3
                         st.markdown(card(r, best=(r is rows[0]),
-                                         watched=(r["ticker"] in wl_tickers)),
+                                         watched=(r["ticker"] in wl_tickers),
+                                         triggered=triggered, aging=aging),
                                     unsafe_allow_html=True)
                         bo, bw = st.columns([3, 1])
                         if bo.button("פתח ניתוח", key=f"o{r['ticker']}",

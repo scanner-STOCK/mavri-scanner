@@ -65,7 +65,8 @@ hr{border-color:var(--ln);}
         font-variant-numeric:tabular-nums;}
 .tc-d span{display:block;font-size:.62rem;color:var(--dm);direction:rtl;}
 .spark svg{width:100%;height:30px;display:block;opacity:.8;}
-.chips{display:flex;gap:.28rem;flex-wrap:wrap;margin:.3rem 0 .1rem;}
+.badges{display:flex;gap:.28rem;flex-wrap:wrap;margin:.35rem 0 0;}
+.chips{display:flex;gap:.28rem;flex-wrap:wrap;margin:.28rem 0 .1rem;}
 .chip{font-size:.62rem;padding:.11rem .4rem;border:1px solid var(--ln);border-radius:2px;color:var(--mu);}
 .chip.g{border-color:rgba(212,166,75,.45);color:var(--gd);}
 .lad{position:relative;height:168px;margin:.4rem 0 .6rem;}
@@ -365,12 +366,20 @@ def core(A, i, C):
     s = max(0, i - C["win"] + 1)
     cw, ow, lw, vw = c[s:i + 1], o[s:i + 1], l[s:i + 1], v[s:i + 1]
     n = len(cw)
-    peak = int(np.argmax(cw[:-1]))
+    # Search for the peak ONLY inside the allowed recency window, instead of
+    # finding the global high of the whole lookback and then rejecting it for
+    # being old. This directly finds fresh local highs even when an older,
+    # bigger high exists earlier in the window — which is exactly the recent
+    # pullback we're looking for, not ancient history.
+    hi_idx = max(0, n - 1 - C["age_lo"])
+    lo_idx = max(0, n - 1 - C["age_hi"])
+    if hi_idx <= lo_idx:
+        return None, "טווח ימים לא תקין"
+    window = cw[lo_idx:hi_idx]
+    if len(window) == 0:
+        return None, "אין טווח לשיא"
+    peak = lo_idx + int(np.argmax(window))
     age = n - 1 - peak
-    if age < C["age_lo"]:
-        return None, "עוד בשיא"
-    if age > C["age_hi"]:
-        return None, "השיא ישן מדי"
     st_ = max(0, peak - C["leg_max"])
     if peak - st_ < C["leg_min"]:
         return None, "אין מקום לזינוק"
@@ -588,12 +597,12 @@ def ladder(r):
 
 def card(r, best=False, watched=False, triggered=False, aging=False):
     ch = "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
-    ch += f'<span class="chip">ATR {r["atr"]:.2f}$</span><span class="chip">RVOL {r["rvol"]:.2f}</span>'
+    ch += f'<span class="chip">ATR {r["atr"]:.2f}$ · RVOL {r["rvol"]:.2f}</span>'
     near = r["to_entry"] <= 1.0
     badges = ""
     if watched:
         badges += ('<span class="badge" style="background:rgba(212,166,75,.18);'
-                   'color:var(--gd)">★ ברשימת מעקב</span>')
+                   'color:var(--gd)">★ מעקב</span>')
     if triggered:
         badges += ('<span class="badge" style="background:rgba(224,96,95,.16);'
                    'color:var(--sh)">כבר הופעל</span>')
@@ -601,7 +610,7 @@ def card(r, best=False, watched=False, triggered=False, aging=False):
         badges += '<span class="badge">קרוב להפעלה</span>'
     if aging:
         badges += ('<span class="badge" style="background:rgba(212,166,75,.12);'
-                   'color:#B98C3E">תבנית מתיישנת</span>')
+                   'color:#B98C3E">מתיישנת</span>')
     is_bd = r.get("kind") == "breakdown"
     if is_bd:
         badges = ('<span class="badge" style="background:rgba(138,111,176,.16);'
@@ -612,11 +621,11 @@ def card(r, best=False, watched=False, triggered=False, aging=False):
     else:
         head_val, head_lab = f"{r['dry']:.2f}×", "יובש נפח"
         sub_lab, sub_val = "ימים מהשיא", str(r["age"])
-    ch = badges + ch
+    badge_row = f'<div class="badges">{badges}</div>' if badges else ""
     return f"""<div class="tc{' top' if best else ''}{' near' if near and not triggered else ''}">
 <div class="tc-h"><div class="tc-s">{r['ticker']}</div>
 <div class="tc-d"><b>{head_val}</b><span>{head_lab}</span></div></div>
-{sparkline(r.get('spark', []))}<div class="chips">{ch}</div>{ladder(r)}
+{sparkline(r.get('spark', []))}{badge_row}<div class="chips">{ch}</div>{ladder(r)}
 <div class="tl"><span>{int(r['shares'])} מניות · סיכון <b>${r['risk_total']:.0f}</b></span>
 <span>יחס <b>1:{r['rr']:.1f}</b></span></div>
 <div class="tl" style="border:0;padding-top:.22rem"><span>{sub_lab}: {sub_val}</span>
@@ -751,6 +760,36 @@ def top_blocker(drop):
     return k, v
 
 
+def funnel_chart(drop):
+    order = ["מחזור נמוך", "נפח מניות נמוך", "מחיר נמוך", "השיא ישן מדי", "עוד בשיא",
+             "זינוק קטן מדי", "זינוק קצר מדי", "אין מקום לזינוק", "כמעט לא תיקנה",
+             "החזירה את כל הזינוק", "הנפח לא התייבש", "רחוקה מדי מהתמיכה",
+             "אין נר בולינג׳ר", "ATR נמוך מדי", "תנודתיות נמוכה", "אין מרווח ל-TP1",
+             "היסטוריה קצרה", "אין נתוני נפח", "סטופ לא תקין", "אין ATR", "שגיאה"]
+    items = [(k, drop[k]) for k in order if drop.get(k)]
+    items += [(k, v) for k, v in drop.items() if k not in order and v]
+    items.sort(key=lambda x: x[1])  # ascending so the worst ends up on top visually
+    if not items:
+        return None
+    labels = [k for k, _ in items]
+    values = [v for _, v in items]
+    colors = ["#C13D4A" if i == len(items) - 1 else "#8E4046" for i in range(len(items))]
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation="h", marker_color=colors, marker_line_width=0,
+        text=[f"{v:,}" for v in values], textposition="outside",
+        textfont=dict(size=12, color="#A8BAC2"),
+        hovertemplate="%{y}<br>%{x:,} מניות<extra></extra>"))
+    fig.update_layout(
+        height=max(220, 30 * len(items) + 40), margin=dict(l=6, r=50, t=8, b=8),
+        paper_bgcolor="#0B1216", plot_bgcolor="#0B1216",
+        font=dict(family="Heebo, Arial, sans-serif", color="#93A8B2", size=12),
+        xaxis=dict(showgrid=True, gridcolor="#17242B", zeroline=False, side="top"),
+        yaxis=dict(showgrid=False, autorange="reversed", tickfont=dict(size=12)),
+        hoverlabel=dict(bgcolor="#131F26", bordercolor="#22333C",
+                        font=dict(family="Heebo", size=12, color="#E9EFF1")))
+    return fig
+
+
 def stat_grid(items):
     cells = "".join(f'<div class="{c}"><b>{v}</b><span>{lab}</span></div>'
                     for lab, v, c in items)
@@ -843,8 +882,9 @@ with st.expander("סינון מתקדם"):
     rr_min = h3.slider("יחס סיכון־סיכוי", 0.5, 5.0, float(P["rr"]), 0.1)
     atr_pct = h4.slider("ATR מינ׳ %", 0.0, 10.0, float(P["atrp"]), 0.25)
     w1, w2 = st.columns(2)
-    win = w1.slider("חלון חיפוש השיא (ימים)", 60, 200, 110, 10,
-                    help="ככל שהחלון גדול יותר, כך 'השיא ישן מדי' פוסל יותר.")
+    win = w1.slider("חלון היסטוריה (ימים)", 100, 250, 150, 10,
+                    help="רקע היסטורי לחישוב נפח בסיס. השיא עצמו נחפש רק בטווח "
+                         "'ימים מהשיא' שהגדרת למעלה — לא כאן.")
 
     st.markdown("##### שבירת תמיכה ותפיסה מחדש")
     n1, n2, n3, n4 = st.columns(4)

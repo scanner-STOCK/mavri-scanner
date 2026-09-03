@@ -133,6 +133,23 @@ div[data-testid="stExpander"]{border:1px solid var(--ln);border-radius:4px;backg
 .rmap .lb.e{color:var(--gd);}
 
 .near{border-color:rgba(47,191,143,.5) !important;}
+.wl-row{display:flex;align-items:center;gap:.8rem;background:var(--pan);
+        border:1px solid var(--ln);border-radius:4px;padding:.6rem .9rem;
+        margin-bottom:.5rem;direction:rtl;}
+.wl-row.live{border-right:3px solid var(--gd);}
+.wl-row.good{border-right:3px solid var(--lg);}
+.wl-row.bad{border-right:3px solid var(--sh);opacity:.72;}
+.wl-row.wait{border-right:3px solid var(--dm);}
+.wl-sym{font-family:'Frank Ruhl Libre',serif;font-size:1.15rem;font-weight:700;
+        color:var(--tx);width:80px;direction:ltr;}
+.wl-st{width:110px;font-size:.78rem;}
+.wl-st.live{color:var(--gd);} .wl-st.good{color:var(--lg);}
+.wl-st.bad{color:var(--sh);} .wl-st.wait{color:var(--dm);}
+.wl-px{font-family:'Frank Ruhl Libre',serif;font-size:.95rem;color:var(--mu);
+       font-variant-numeric:tabular-nums;width:90px;direction:ltr;}
+.wl-r{width:80px;font-size:.85rem;font-variant-numeric:tabular-nums;direction:ltr;}
+.wl-r.p{color:var(--lg);} .wl-r.n{color:var(--sh);} .wl-r.z{color:var(--dm);}
+.wl-note{flex:1;font-size:.74rem;color:var(--dm);}
 .badge{display:inline-block;font-size:.6rem;padding:.1rem .4rem;border-radius:2px;
        background:rgba(47,191,143,.16);color:var(--lg);margin-right:.3rem;}
 a.tv{font-size:.68rem;color:var(--dm);text-decoration:none;border-bottom:1px dotted var(--ln);}
@@ -409,12 +426,15 @@ def ladder(r):
     return f'<div class="lad">{html}</div>'
 
 
-def card(r, best=False):
+def card(r, best=False, watched=False):
     ch = "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
     ch += f'<span class="chip">ATR {r["atr"]:.2f}$</span><span class="chip">RVOL {r["rvol"]:.2f}</span>'
     near = r["to_entry"] <= 1.0
     if near:
         ch = '<span class="badge">קרוב להפעלה</span>' + ch
+    if watched:
+        ch = '<span class="badge" style="background:rgba(212,166,75,.18);color:var(--gd)">'\
+             '★ ברשימת מעקב</span>' + ch
     return f"""<div class="tc{' top' if best else ''}{' near' if near else ''}">
 <div class="tc-h"><div class="tc-s">{r['ticker']}</div>
 <div class="tc-d"><b>{r['dry']:.2f}×</b><span>יובש נפח</span></div></div>
@@ -424,6 +444,98 @@ def card(r, best=False):
 <div class="tl" style="border:0;padding-top:.22rem"><span>{r['age']} ימים מהשיא</span>
 <span>הפעלה ב-<b>{r['to_entry']:+.1f}%</b></span></div>
 <div class="tw">{r['why']}</div></div>"""
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def live(tickers):
+    """Fresh-ish quotes for the watchlist. 60-second cache."""
+    out = {}
+    if not tickers:
+        return out
+    try:
+        raw = yf.download(list(tickers), period="1mo", interval="1d", group_by="ticker",
+                          auto_adjust=False, threads=True, progress=False, timeout=30)
+    except Exception:
+        return out
+    if raw is None or len(raw) == 0:
+        return out
+    for t in tickers:
+        try:
+            d = (raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw).dropna()
+            if len(d):
+                out[t] = d
+        except Exception:
+            pass
+    return out
+
+
+def wl_encode(items):
+    return ",".join(f"{i['ticker']}:{i['entry']:.2f}:{i['stop']:.2f}:{i['tp1']:.2f}:"
+                    f"{i['tp2']:.2f}:{i['tp3']:.2f}:{int(i['shares'])}" for i in items)
+
+
+def wl_decode(txt):
+    out = []
+    for chunk in (txt or "").split(","):
+        f = chunk.split(":")
+        if len(f) == 7:
+            try:
+                out.append(dict(ticker=f[0], entry=float(f[1]), stop=float(f[2]),
+                                tp1=float(f[3]), tp2=float(f[4]), tp3=float(f[5]),
+                                shares=int(f[6])))
+            except Exception:
+                pass
+    return out
+
+
+def wl_load():
+    if "WL" not in st.session_state:
+        st.session_state["WL"] = wl_decode(st.query_params.get("w", ""))
+    return st.session_state["WL"]
+
+
+def wl_save():
+    st.query_params["w"] = wl_encode(st.session_state["WL"])
+
+
+def wl_toggle(r):
+    wl = wl_load()
+    if any(x["ticker"] == r["ticker"] for x in wl):
+        st.session_state["WL"] = [x for x in wl if x["ticker"] != r["ticker"]]
+    else:
+        st.session_state["WL"] = wl + [dict(ticker=r["ticker"], entry=r["entry"],
+                                            stop=r["stop"], tp1=r["tp1"], tp2=r["tp2"],
+                                            tp3=r["tp3"], shares=r["shares"])]
+    wl_save()
+
+
+def wl_status(item, d):
+    """Where the trade stands, using daily bars since it was saved."""
+    if d is None or len(d) == 0:
+        return dict(state="אין נתונים", cls="", px=0.0, r=0.0, note="")
+    px = float(d["Close"].iloc[-1])
+    w = d.tail(15)
+    hi, lo = w["High"].values, w["Low"].values
+    risk = item["entry"] - item["stop"]
+    trig_i = next((k for k in range(len(hi)) if hi[k] >= item["entry"]), None)
+    if trig_i is None:
+        dist = (item["entry"] / px - 1) * 100
+        return dict(state="ממתין", cls="wait", px=px, r=0.0,
+                    note=f"{dist:+.1f}% עד ההפעלה")
+    after_lo, after_hi = lo[trig_i:], hi[trig_i:]
+    if after_lo.min() <= item["stop"]:
+        return dict(state="נפגע סטופ", cls="bad", px=px, r=-1.0, note="העסקה נסגרה בהפסד")
+    if after_hi.max() >= item["tp3"]:
+        return dict(state="TP3 הושג", cls="good", px=px,
+                    r=(item["tp3"] - item["entry"]) / risk, note="העסקה מוצתה")
+    if after_hi.max() >= item["tp2"]:
+        return dict(state="TP2 הושג", cls="good", px=px,
+                    r=(px - item["entry"]) / risk, note="להזיז סטופ לכניסה")
+    if after_hi.max() >= item["tp1"]:
+        return dict(state="TP1 הושג", cls="good", px=px,
+                    r=(px - item["entry"]) / risk, note="למכור שליש, סטופ לכניסה")
+    return dict(state="בפוזיציה", cls="live", px=px, r=(px - item["entry"]) / risk,
+                note=f"{(item['tp1']/px-1)*100:+.1f}% עד TP1")
 
 
 def funnel_html(total, drop):
@@ -488,6 +600,7 @@ st.markdown(f"""<div class="bar">
   <div><i>שעה בישראל</i><b>{now:%H:%M}</b></div>
   <div><i>תאריך</i><b>{now:%d.%m.%y}</b></div>
 </div></div>""", unsafe_allow_html=True)
+_ = wl_load()  # ensure state hydrated from URL before anything renders
 
 if "P" not in st.session_state:
     st.session_state["P"] = dict(PRESETS["התבנית שלי"])
@@ -550,6 +663,52 @@ C = dict(leg_min=leg_min, leg_max=leg_max, rise_min=rise_min, retr_lo=retr[0],
 
 # ---------------------------------------------------------------- detail
 
+def render_watchlist():
+    wl = wl_load()
+    if not wl:
+        return
+    st.markdown("### רשימת מעקב")
+    tickers = tuple(x["ticker"] for x in wl)
+    data = live(tickers)
+    active, closed = [], []
+    for item in wl:
+        st_ = wl_status(item, data.get(item["ticker"]))
+        (closed if st_["state"] in ("נפגע סטופ", "TP3 הושג") else active).append((item, st_))
+
+    for item, st_ in active:
+        r_cls = "z" if abs(st_["r"]) < .05 else ("p" if st_["r"] > 0 else "n")
+        st.markdown(f"""<div class="wl-row {st_['cls']}">
+<div class="wl-sym">{item['ticker']}</div>
+<div class="wl-st {st_['cls']}">{st_['state']}</div>
+<div class="wl-px">${st_['px']:.2f}</div>
+<div class="wl-r {r_cls}">{st_['r']:+.2f}R</div>
+<div class="wl-note">{st_['note']}</div>
+</div>""", unsafe_allow_html=True)
+        b1, b2 = st.columns([1, 6])
+        if b1.button("פתח", key=f"wlopen_{item['ticker']}"):
+            st.session_state["open"] = item["ticker"]
+            st.rerun()
+
+    if closed:
+        with st.expander(f"נסגרו ({len(closed)})"):
+            for item, st_ in closed:
+                r_cls = "p" if st_["r"] > 0 else "n"
+                st.markdown(f"""<div class="wl-row {st_['cls']}">
+<div class="wl-sym">{item['ticker']}</div>
+<div class="wl-st {st_['cls']}">{st_['state']}</div>
+<div class="wl-px">${st_['px']:.2f}</div>
+<div class="wl-r {r_cls}">{st_['r']:+.2f}R</div>
+<div class="wl-note">{st_['note']}</div></div>""", unsafe_allow_html=True)
+            if st.button("נקה עסקאות שנסגרו"):
+                keep = {i["ticker"] for i, s_ in active}
+                st.session_state["WL"] = [x for x in wl if x["ticker"] in keep]
+                wl_save()
+                st.rerun()
+    st.markdown("---")
+
+
+render_watchlist()
+
 if st.session_state.get("open"):
     r = next((x for x in st.session_state.get("rows", [])
               if x["ticker"] == st.session_state["open"]), None)
@@ -557,7 +716,7 @@ if st.session_state.get("open"):
         st.session_state["open"] = None
         st.rerun()
 
-    nav1, nav2 = st.columns([1, 4])
+    nav1, nav2, nav3 = st.columns([1, 3.4, 1])
     if nav1.button("→  חזרה לרשימה", use_container_width=True):
         st.session_state["open"] = None
         st.rerun()
@@ -566,6 +725,10 @@ if st.session_state.get("open"):
                           label_visibility="collapsed")
     if jump != r["ticker"]:
         st.session_state["open"] = jump
+        st.rerun()
+    in_wl = r["ticker"] in {x["ticker"] for x in wl_load()}
+    if nav3.button("★ במעקב" if in_wl else "☆ הוסף למעקב", use_container_width=True):
+        wl_toggle(r)
         st.rerun()
 
     INTERVALS = {
@@ -752,9 +915,15 @@ if go_:
 # ---------------------------------------------------------------- results
 
 if "rows" not in st.session_state:
-    st.markdown('<div class="empty">בחר פריסט או הגדר סינון, ולחץ על סריקה.<br>'
-                'המערכת מחפשת מניות שזינקו בנפח, תיקנו בנפח נמוך, '
-                'ונמצאות עכשיו על התמיכה.</div>', unsafe_allow_html=True)
+    if wl_load():
+        st.info("הרשימה שלך למעלה נשמרת בכתובת הדף — סמן אותה במועדפים כדי לחזור אליה "
+                "מכל מכשיר, כולל הטלפון.")
+    else:
+        st.markdown('<div class="empty">בחר פריסט או הגדר סינון, ולחץ על סריקה.<br>'
+                    'המערכת מחפשת מניות שזינקו בנפח, תיקנו בנפח נמוך, '
+                    'ונמצאות עכשיו על התמיכה.<br><br>'
+                    'מניה שתסמן ב-☆ תישאר ברשימת המעקב למעלה, בזמן אמת, '
+                    'עד שהיא תפגע בסטופ או תגיע ל-TP3.</div>', unsafe_allow_html=True)
 else:
     rows = st.session_state["rows"]
     u, l_ = st.session_state["stats"]
@@ -822,18 +991,34 @@ else:
                              "TP3": st.column_config.NumberColumn(format="$%.2f"),
                              "% לכניסה": st.column_config.NumberColumn(format="%+.2f%%")})
             pick = st.selectbox("פתח ניתוח", [r["ticker"] for r in rows])
-            if st.button("פתח", type="primary"):
+            tb1, tb2 = st.columns([3, 1])
+            if tb1.button("פתח", type="primary", use_container_width=True):
                 st.session_state["open"] = pick
                 st.rerun()
+            wl_tickers = {x["ticker"] for x in wl_load()}
+            picked_row = next(r for r in rows if r["ticker"] == pick)
+            star = "★ הסר ממעקב" if pick in wl_tickers else "☆ הוסף למעקב"
+            if tb2.button(star, use_container_width=True):
+                wl_toggle(picked_row)
+                st.rerun()
         else:
+            wl_tickers = {x["ticker"] for x in wl_load()}
             for start in range(0, len(rows), 3):
                 cols = st.columns(3, gap="medium")
                 for col, r in zip(cols, rows[start:start + 3]):
                     with col:
-                        st.markdown(card(r, best=(r is rows[0])), unsafe_allow_html=True)
-                        if st.button("פתח ניתוח", key=f"o{r['ticker']}",
+                        st.markdown(card(r, best=(r is rows[0]),
+                                         watched=(r["ticker"] in wl_tickers)),
+                                    unsafe_allow_html=True)
+                        bo, bw = st.columns([3, 1])
+                        if bo.button("פתח ניתוח", key=f"o{r['ticker']}",
                                      use_container_width=True):
                             st.session_state["open"] = r["ticker"]
+                            st.rerun()
+                        star = "★" if r["ticker"] in wl_tickers else "☆"
+                        if bw.button(star, key=f"w{r['ticker']}", use_container_width=True,
+                                     help="הוסף/הסר מרשימת המעקב"):
+                            wl_toggle(r)
                             st.rerun()
 
         with st.expander("מפל הסינון — איפה המניות נפלו"):

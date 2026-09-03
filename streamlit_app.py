@@ -209,11 +209,12 @@ SE MELI GRAB CPNG STNE PAGS VIST GGAL BMA PAM YPF TS TX
 
 PRESETS = {
     "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", bbmode="בונוס", price=10.0, dv=15.0,
-                       sh=0.3, atr=1.0, atrp=2.0, rise=12, age=(3, 45), retr=(20, 70), rr=1.5),
-    "רחב": dict(dry=1.10, bb="אחת מהשתיים", bbmode="בונוס", price=5.0, dv=8.0, sh=0.2,
-                atr=0.4, atrp=1.5, rise=8, age=(2, 60), retr=(15, 85), rr=1.0),
+                       sh=0.3, atr=1.0, atrp=2.0, rise=12, age=(3, 45), retr=(20, 70),
+                       rr=1.5, off=12),
+    "רחב": dict(dry=1.05, bb="אחת מהשתיים", bbmode="בונוס", price=5.0, dv=8.0, sh=0.2,
+                atr=0.4, atrp=1.5, rise=6, age=(2, 60), retr=(12, 88), rr=1.0, off=20),
     "מחמיר": dict(dry=1.45, bb="רצועה תחתונה", bbmode="חובה", price=15.0, dv=40.0, sh=1.0,
-                  atr=1.5, atrp=3.0, rise=20, age=(3, 25), retr=(30, 65), rr=2.0),
+                  atr=1.5, atrp=3.0, rise=20, age=(3, 25), retr=(30, 65), rr=2.0, off=8),
 }
 
 
@@ -360,6 +361,9 @@ def core(A, i, C):
         if C["bb_hard"] and not tags:
             return None, "אין נר על בולינג׳ר"
     sup = float(lw[peak:].min())
+    off_low = (px / sup - 1) * 100 if sup > 0 else 999
+    if off_low > C["off_max"]:
+        return None, "רחוקה מדי מהתמיכה"
     a = float(A["atr"][i])
     if not np.isfinite(a) or a <= 0:
         return None, "אין ATR"
@@ -408,6 +412,97 @@ def day_trade_plan(r):
                 rr1=round((t1 - entry) / risk, 2) if risk > 0 else 0,
                 rr2=round((t2 - entry) / risk, 2) if risk > 0 else 0,
                 rr3=round((t3 - entry) / risk, 2) if risk > 0 else 0)
+
+
+def core_breakdown(A, i, C):
+    """Support broken, then reclaimed: potential failed-breakdown reversal."""
+    c, o, h, l, v = A["c"], A["o"], A["h"], A["l"], A["v"]
+    if i < 80:
+        return None, "היסטוריה קצרה"
+    s = max(0, i - C["win"] + 1)
+    cw, ow, lw, hw, vw = c[s:i + 1], o[s:i + 1], l[s:i + 1], h[s:i + 1], v[s:i + 1]
+    n = len(cw)
+    if n < C["sup_win"] + C["break_win"] + 5:
+        return None, "היסטוריה קצרה לתבנית"
+
+    pre_end = n - C["break_win"]
+    pre_start = max(0, pre_end - C["sup_win"])
+    if pre_end - pre_start < 10:
+        return None, "אין מספיק נתוני תמיכה"
+    support = float(np.min(lw[pre_start:pre_end]))
+    if support <= 0:
+        return None, "תמיכה לא תקינה"
+
+    brk_low = float(np.min(lw[pre_end:]))
+    brk_pct = (support - brk_low) / support * 100
+    if brk_pct < C["break_min"]:
+        return None, "לא נשברה תמיכה מספיק"
+    if brk_pct > C["break_max"]:
+        return None, "שבירה עמוקה מדי"
+
+    px = float(cw[-1])
+    reclaim_dist = (px / support - 1) * 100
+    if reclaim_dist < C["reclaim_lo"]:
+        return None, "עוד לא תפסה מחדש"
+    if reclaim_dist > C["reclaim_hi"]:
+        return None, "כבר התרחקה מדי מהתמיכה"
+
+    base_v = float(np.mean(vw[max(0, pre_start - 30):pre_start])) if pre_start > 5 \
+             else float(np.mean(vw[:max(pre_start, 1)]))
+    brk_v = vw[pre_end:]
+    if base_v <= 0 or len(brk_v) == 0:
+        return None, "אין נתוני נפח"
+    brk_spike = float(np.max(brk_v) / base_v)
+
+    rvol = float(v[i - 2:i + 1].mean() / v[max(0, i - 49):i + 1].mean())
+    a = float(A["atr"][i])
+    if not np.isfinite(a) or a <= 0:
+        return None, "אין ATR"
+    if a < C["atr_abs"]:
+        return None, "ATR נמוך מדי"
+    atr_pct = a / px * 100
+    if atr_pct < C["atr_pct"]:
+        return None, "תנודתיות נמוכה"
+
+    green_now = int((c[i - 2:i + 1] > o[i - 2:i + 1]).sum())
+    if C["need_trig"] and green_now == 0:
+        return None, "אין נר היפוך"
+
+    entry = max(px, float(h[i])) + .05 * a
+    stop = min(brk_low - .3 * a, entry - 2.2 * a)
+    risk = entry - stop
+    if risk <= 0:
+        return None, "סטופ לא תקין"
+
+    resistance = float(np.max(hw[pre_start:pre_end]))
+    if resistance <= entry:
+        resistance = entry + 2.6 * risk
+    span = resistance - support
+    t1 = max(support + span * .4, entry + 1.0 * risk)
+    t2 = max(support + span * .7, entry + 1.8 * risk)
+    t3 = max(resistance, entry + 2.6 * risk)
+    rr = (t1 - entry) / risk
+    if rr < C["rr_min"]:
+        return None, "אין מרווח ליעד"
+
+    return dict(kind="breakdown", support=round(support, 2), brk_low=round(brk_low, 2),
+                brk_pct=round(brk_pct, 1), spike=round(brk_spike, 2),
+                reclaim_pct=round(reclaim_dist, 1), resistance=round(resistance, 2),
+                price=round(px, 2), entry=round(entry, 2), stop=round(stop, 2),
+                tp1=round(t1, 2), tp2=round(t2, 2), tp3=round(t3, 2),
+                rr=round(float(rr), 2), rr3=round(float((t3 - entry) / risk), 2),
+                risk_share=round(float(risk), 2), to_entry=round((entry / px - 1) * 100, 2),
+                rvol=round(rvol, 2), atr=round(a, 2), atr_pct=round(atr_pct, 1),
+                age=0, rise=round(brk_pct, 1), leg_bars=C["break_win"],
+                dry=round(brk_spike, 2), retrace=round(reclaim_dist, 1), bb=[],
+                peak_px=round(resistance, 2), base=round(brk_low, 2),
+                spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
+
+
+def why_breakdown(r):
+    return (f"שברה תמיכה ב-{r['brk_pct']:.1f}% בנפח פי {r['spike']:.1f}, "
+            f"תפסה אותה מחדש (עכשיו {r['reclaim_pct']:+.1f}% מעליה), "
+            f"התנגדות קרובה ב-{r['resistance']:.2f}")
 
 
 def why_he(r):
@@ -462,14 +557,24 @@ def card(r, best=False, watched=False, triggered=False, aging=False):
     if aging:
         badges += ('<span class="badge" style="background:rgba(212,166,75,.12);'
                    'color:#B98C3E">תבנית מתיישנת</span>')
+    is_bd = r.get("kind") == "breakdown"
+    if is_bd:
+        badges = ('<span class="badge" style="background:rgba(138,111,176,.16);'
+                  'color:#A98FD1">שבירה ותפיסה</span>') + badges
+        head_val, head_lab = f"{r['reclaim_pct']:+.1f}%", "מעל תמיכה"
+        sub_lab = "מאז השבירה" if r.get("break_win") is None else "ימי חלון"
+        sub_val = f"{r.get('leg_bars', '—')}"
+    else:
+        head_val, head_lab = f"{r['dry']:.2f}×", "יובש נפח"
+        sub_lab, sub_val = "ימים מהשיא", str(r["age"])
     ch = badges + ch
     return f"""<div class="tc{' top' if best else ''}{' near' if near and not triggered else ''}">
 <div class="tc-h"><div class="tc-s">{r['ticker']}</div>
-<div class="tc-d"><b>{r['dry']:.2f}×</b><span>יובש נפח</span></div></div>
+<div class="tc-d"><b>{head_val}</b><span>{head_lab}</span></div></div>
 {sparkline(r.get('spark', []))}<div class="chips">{ch}</div>{ladder(r)}
 <div class="tl"><span>{int(r['shares'])} מניות · סיכון <b>${r['risk_total']:.0f}</b></span>
 <span>יחס <b>1:{r['rr']:.1f}</b></span></div>
-<div class="tl" style="border:0;padding-top:.22rem"><span>{r['age']} ימים מהשיא</span>
+<div class="tl" style="border:0;padding-top:.22rem"><span>{sub_lab}: {sub_val}</span>
 <span>הפעלה ב-<b>{ltr(f"{r['to_entry']:+.1f}%")}</b></span></div>
 <div class="tw">{r['why']}</div></div>"""
 
@@ -550,8 +655,9 @@ def wl_status(item, d):
     trig_i = next((k for k in range(len(hi)) if hi[k] >= item["entry"]), None)
     if trig_i is None:
         dist = (item["entry"] / px - 1) * 100
+        pct_txt = f"{dist:+.1f}%"
         return dict(state="ממתין", cls="wait", px=px, r=0.0, pct=pct_live,
-                    note=f'עד ההפעלה {ltr(f"{dist:+.1f}%")}')
+                    note="עד ההפעלה " + ltr(pct_txt))
     after_lo, after_hi = lo[trig_i:], hi[trig_i:]
     if after_lo.min() <= item["stop"]:
         return dict(state="נפגע סטופ", cls="bad", px=px, r=-1.0, pct=pct_live,
@@ -565,9 +671,10 @@ def wl_status(item, d):
     if after_hi.max() >= item["tp1"]:
         return dict(state="TP1 הושג", cls="good", px=px, pct=pct_live,
                     r=(px - item["entry"]) / risk, note="למכור שליש, סטופ לכניסה")
+    tp1_pct = (item["tp1"] / px - 1) * 100
     return dict(state="בפוזיציה", cls="live", px=px, pct=pct_live,
                 r=(px - item["entry"]) / risk,
-                note=f'עד TP1 {ltr(f"{(item["tp1"]/px-1)*100:+.1f}%")}')
+                note="עד TP1 " + ltr(f"{tp1_pct:+.1f}%"))
 
 
 def funnel_html(total, drop):
@@ -662,25 +769,44 @@ if fresh:
     fetch.clear()
     go_ = True
 
+ptype = st.radio("סוג תבנית", ["זינוק ותיקון לתמיכה", "שבירת תמיכה ותפיסה מחדש", "שתי התבניות"],
+                 horizontal=True)
+
 with st.expander("סינון מתקדם"):
+    st.markdown("##### זינוק ותיקון")
     g1, g2, g3, g4 = st.columns(4)
     agev = g1.slider("ימים מהשיא", 1, 90, tuple(P["age"]))
     retr = g2.slider("עומק תיקון %", 5, 95, tuple(P["retr"]))
     rise_min = g3.slider("גודל זינוק מינ׳ %", 3, 100, int(P["rise"]))
-    atr_pct = g4.slider("ATR מינ׳ %", 0.0, 10.0, float(P["atrp"]), 0.25)
+    off_max = g4.slider("מרחק מקס׳ מתמיכה %", 2, 40, int(P.get("off", 12)),
+                        help="כמה אחוז מעל התמיכה המחיר יכול להיות ועדיין להיחשב 'עליה'.")
     h1, h2, h3, h4 = st.columns(4)
     leg_min = h1.slider("ימי זינוק מינ׳", 3, 20, 5)
     leg_max = h2.slider("ימי זינוק מקס׳", 8, 60, 30)
     rr_min = h3.slider("יחס סיכון־סיכוי", 0.5, 5.0, float(P["rr"]), 0.1)
-    min_sh = h4.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P["sh"]), 0.1,
-                             help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
+    win = h4.slider("חלון חיפוש השיא (ימים)", 60, 200, 110, 10,
+                    help="ככל שהחלון גדול יותר, כך 'השיא ישן מדי' פוסל יותר.")
+
+    st.markdown("##### שבירת תמיכה ותפיסה מחדש")
+    n1, n2, n3, n4 = st.columns(4)
+    sup_win = n1.slider("ימים לקביעת התמיכה", 15, 90, 35)
+    break_win = n2.slider("חלון השבירה (ימים אחרונים)", 1, 10, 4)
+    break_min = n3.slider("שבירה מינ׳ %", 0.5, 15.0, 2.0, 0.5)
+    break_max = n4.slider("שבירה מקס׳ %", 3.0, 30.0, 12.0, 0.5)
+    n5, n6, n7 = st.columns(3)
+    reclaim_lo = n5.slider("תפיסה מחדש מינ׳ %", -5.0, 10.0, -1.0, 0.5,
+                           help="שלילי = עוד מתחת לתמיכה אך קרוב. חיובי = כבר מעליה.")
+    reclaim_hi = n6.slider("תפיסה מחדש מקס׳ %", 1.0, 20.0, 8.0, 0.5)
+    need_trig_b = n7.checkbox("חייב נר ירוק בתפיסה", value=True)
+
+    st.markdown("##### כללי")
     j1, j2, j3, j4 = st.columns(4)
     bbmode = j1.selectbox("בולינג׳ר כ־", ["בונוס", "חובה"],
                           index=["בונוס", "חובה"].index(P.get("bbmode", "בונוס")),
                           help="בונוס = מסומן בתווית אך לא פוסל. חובה = מסנן.")
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
-    win = j3.slider("חלון חיפוש השיא (ימים)", 60, 200, 110, 10,
-                    help="ככל שהחלון גדול יותר, כך 'השיא ישן מדי' פוסל יותר.")
+    min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P["sh"]), 0.1,
+                             help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
     limit = j4.slider("מספר מניות לסריקה", 200, 2500, 1500, 100)
     k1, k2 = st.columns(2)
     acct = k1.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
@@ -689,9 +815,13 @@ with st.expander("סינון מתקדם"):
 C = dict(leg_min=leg_min, leg_max=leg_max, rise_min=rise_min, retr_lo=retr[0],
          retr_hi=retr[1], age_lo=agev[0], age_hi=agev[1], atr_pct=atr_pct,
          atr_abs=atr_abs, rr_min=rr_min, dry_min=dry_min, bb_look=bb_look, win=win,
-         bb_hard=(bbmode == "חובה"),
+         off_max=off_max, bb_hard=(bbmode == "חובה"),
          bb={"כבוי": "off", "רצועה תחתונה": "lower",
              "רצועה עליונה": "upper", "אחת מהשתיים": "both"}[bb_lbl])
+
+CB = dict(win=win, sup_win=sup_win, break_win=break_win, break_min=break_min,
+          break_max=break_max, reclaim_lo=reclaim_lo, reclaim_hi=reclaim_hi,
+          atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min, need_trig=need_trig_b)
 
 # ---------------------------------------------------------------- detail
 
@@ -791,88 +921,123 @@ if st.session_state.get("open"):
             fetch_one.clear()
             st.rerun()
     else:
+        # ---- categorical x-axis: real trading bars only, no timezone-dependent
+        # rangebreaks, no dead space. Every pixel of width is real data. ----
+        n = len(v)
+        xs = list(range(n))
+        if iv == "1d":
+            dtxt = [d.strftime("%d.%m.%y") for d in v.index]
+        elif iv == "1wk":
+            dtxt = [d.strftime("שבוע %d.%m.%y") for d in v.index]
+        else:
+            dtxt = [d.strftime("%d.%m  %H:%M") for d in v.index]
+
+        n_ticks = min(8, n)
+        tick_idx = sorted(set(int(k) for k in np.linspace(0, n - 1, n_ticks)))
+        tick_txt = [dtxt[k] for k in tick_idx]
+
         rows_n = 3 if show_rsi else 2
-        heights = [.60, .20, .20] if show_rsi else [.78, .22]
+        heights = [.62, .19, .19] if show_rsi else [.78, .22]
         fig = make_subplots(rows=rows_n, cols=1, shared_xaxes=True,
-                            row_heights=heights, vertical_spacing=.018)
-        if "בולינג׳ר" in ind and len(v) > 20:
+                            row_heights=heights, vertical_spacing=.02)
+
+        if "בולינג׳ר" in ind and n > 20:
             mid, sd = v["Close"].rolling(20).mean(), v["Close"].rolling(20).std()
-            fig.add_trace(go.Scatter(x=v.index, y=mid + 2 * sd, line=dict(color="#33505E", width=1),
+            fig.add_trace(go.Scatter(x=xs, y=mid + 2 * sd, line=dict(color="#33505E", width=1.1),
                                      name="BB עליון", hoverinfo="skip"), 1, 1)
-            fig.add_trace(go.Scatter(x=v.index, y=mid - 2 * sd, line=dict(color="#33505E", width=1),
-                                     fill="tonexty", fillcolor="rgba(51,80,94,.13)",
+            fig.add_trace(go.Scatter(x=xs, y=mid - 2 * sd, line=dict(color="#33505E", width=1.1),
+                                     fill="tonexty", fillcolor="rgba(51,80,94,.14)",
                                      name="BB תחתון", hoverinfo="skip"), 1, 1)
-        fig.add_trace(go.Candlestick(x=v.index, open=v.Open, high=v.High, low=v.Low,
-                                     close=v.Close, name=r["ticker"],
-                                     increasing_line_color="#2FBF8F",
-                                     decreasing_line_color="#E0605F",
-                                     increasing_fillcolor="#2FBF8F",
-                                     decreasing_fillcolor="#E0605F"), 1, 1)
+
+        fig.add_trace(go.Candlestick(
+            x=xs, open=v.Open, high=v.High, low=v.Low, close=v.Close,
+            name=r["ticker"], text=dtxt, hovertext=dtxt,
+            increasing_line_color="#2FBF8F", decreasing_line_color="#E0605F",
+            increasing_fillcolor="#2FBF8F", decreasing_fillcolor="#E0605F",
+            increasing_line_width=1.4, decreasing_line_width=1.4,
+            hovertemplate="%{text}<br>O %{open:.2f}  H %{high:.2f}<br>"
+                          "L %{low:.2f}  C %{close:.2f}<extra></extra>"), 1, 1)
+
         for nm, per_, col in [("SMA20", 20, "#4E8FB0"), ("SMA50", 50, "#D4A64B"),
                               ("SMA200", 200, "#8A6FB0")]:
-            if nm in ind and len(v) > per_:
-                fig.add_trace(go.Scatter(x=v.index, y=v["Close"].rolling(per_).mean(),
-                                         line=dict(color=col, width=1), name=nm), 1, 1)
+            if nm in ind and n > per_:
+                fig.add_trace(go.Scatter(x=xs, y=v["Close"].rolling(per_).mean(),
+                                         line=dict(color=col, width=1.6), name=nm), 1, 1)
         if "VWAP" in ind:
             tp = (v["High"] + v["Low"] + v["Close"]) / 3
             vw = (tp * v["Volume"]).cumsum() / v["Volume"].cumsum().replace(0, np.nan)
-            fig.add_trace(go.Scatter(x=v.index, y=vw, line=dict(color="#C77DBA", width=1,
-                                                                dash="dot"), name="VWAP"), 1, 1)
-        if "אזורי תבנית" in ind and iv == "1d":
-            try:
-                pk = v.index[-1 - r["age"]]
-                lg = v.index[-1 - r["age"] - r["leg_bars"]]
-                fig.add_vrect(x0=lg, x1=pk, fillcolor="#2FBF8F", opacity=.07,
-                              line_width=0, row=1, col=1)
-                fig.add_vrect(x0=pk, x1=v.index[-1], fillcolor="#E0605F", opacity=.07,
-                              line_width=0, row=1, col=1)
-            except Exception:
-                pass
+            fig.add_trace(go.Scatter(x=xs, y=vw, line=dict(color="#C77DBA", width=1.4,
+                                                            dash="dot"), name="VWAP"), 1, 1)
+        if "אזורי תבנית" in ind and iv == "1d" and r["age"] + r["leg_bars"] < n:
+            lg_x, pk_x = n - 1 - r["age"] - r["leg_bars"], n - 1 - r["age"]
+            fig.add_vrect(x0=lg_x, x1=pk_x, fillcolor="#2FBF8F", opacity=.08,
+                          line_width=0, row=1, col=1)
+            fig.add_vrect(x0=pk_x, x1=n - 1, fillcolor="#E0605F", opacity=.08,
+                          line_width=0, row=1, col=1)
         if "רמות עסקה" in ind:
-            for y_, lab, col, dash in [(r["entry"], "כניסה", "#D4A64B", "solid"),
-                                       (r["stop"], "סטופ", "#E0605F", "dash"),
-                                       (r["support"], "תמיכה", "#6C8896", "dot"),
-                                       (r["tp1"], "TP1", "#2FBF8F", "dot"),
-                                       (r["tp2"], "TP2", "#2FBF8F", "dot"),
-                                       (r["tp3"], "TP3", "#2FBF8F", "dot")]:
-                fig.add_hline(y=y_, line_dash=dash, line_color=col, line_width=1,
-                              annotation_text=f"{lab} {y_:.2f}", annotation_position="right",
-                              annotation_font_size=10, annotation_font_color=col, row=1, col=1)
+            lvl_list = [(r["entry"], "כניסה", "#D4A64B", "solid"),
+                       (r["stop"], "סטופ", "#E0605F", "dash"),
+                       (r.get("support", r["stop"]), "תמיכה", "#6C8896", "dot"),
+                       (r["tp1"], "TP1", "#2FBF8F", "dot"),
+                       (r["tp2"], "TP2", "#2FBF8F", "dot"),
+                       (r["tp3"], "TP3", "#2FBF8F", "dot")]
+            if r.get("kind") == "breakdown":
+                lvl_list.append((r.get("resistance", r["tp3"]), "התנגדות", "#8A6FB0", "dot"))
+            for y_, lab, col, dash in lvl_list:
+                fig.add_hline(y=y_, line_dash=dash, line_color=col, line_width=1.2,
+                              annotation_text=f"{lab}  {y_:.2f}", annotation_position="right",
+                              annotation_font_size=12, annotation_font_color=col, row=1, col=1)
+
         vc = ["#2FBF8F" if x >= y2 else "#E0605F" for x, y2 in zip(v.Close, v.Open)]
-        fig.add_trace(go.Bar(x=v.index, y=v.Volume, marker_color=vc, marker_line_width=0,
-                             opacity=.5, name="נפח", showlegend=False), 2, 1)
-        if len(v) > 20:
-            fig.add_trace(go.Scatter(x=v.index, y=v["Volume"].rolling(20).mean(),
-                                     line=dict(color="#93A8B2", width=1), showlegend=False,
+        fig.add_trace(go.Bar(x=xs, y=v.Volume, marker_color=vc, marker_line_width=0,
+                             opacity=.55, name="נפח", hovertext=dtxt,
+                             hovertemplate="%{hovertext}<br>נפח %{y:,.0f}<extra></extra>",
+                             showlegend=False), 2, 1)
+        if n > 20:
+            fig.add_trace(go.Scatter(x=xs, y=v["Volume"].rolling(20).mean(),
+                                     line=dict(color="#93A8B2", width=1.2), showlegend=False,
                                      hoverinfo="skip"), 2, 1)
-        if show_rsi and len(v) > 15:
+
+        if show_rsi and n > 15:
             dl = v["Close"].diff()
             up = dl.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
             dn = (-dl.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-            fig.add_trace(go.Scatter(x=v.index, y=100 - 100 / (1 + up / dn.replace(0, np.nan)),
-                                     line=dict(color="#D4A64B", width=1.2), name="RSI",
+            fig.add_trace(go.Scatter(x=xs, y=100 - 100 / (1 + up / dn.replace(0, np.nan)),
+                                     line=dict(color="#D4A64B", width=1.5), name="RSI",
+                                     hovertext=dtxt, hovertemplate="%{hovertext}<br>RSI %{y:.1f}"
+                                                                    "<extra></extra>",
                                      showlegend=False), 3, 1)
             for lvl, cl in [(70, "#E0605F"), (30, "#2FBF8F"), (50, "#2A3D47")]:
-                fig.add_hline(y=lvl, line_color=cl, line_width=.8, line_dash="dot", row=3, col=1)
+                fig.add_hline(y=lvl, line_color=cl, line_width=.9, line_dash="dot", row=3, col=1)
             fig.update_yaxes(range=[0, 100], row=3, col=1)
-        if iv != "1d":
-            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]),
-                                          dict(bounds=[16, 9.5], pattern="hour")])
-        fig.update_layout(height=680 if show_rsi else 560, xaxis_rangeslider_visible=False,
-                          font_family="Heebo", font_color="#93A8B2", hovermode="x unified",
-                          dragmode="pan", paper_bgcolor="#0B1216", plot_bgcolor="#0B1216",
-                          legend=dict(orientation="h", y=1.04, x=0, bgcolor="rgba(0,0,0,0)",
-                                      font=dict(size=10)),
-                          margin=dict(l=6, r=88, t=26, b=6))
-        fig.update_xaxes(showgrid=False, linecolor="#22333C")
-        fig.update_yaxes(gridcolor="#17242B", zeroline=False, linecolor="#22333C")
+
+        fig.update_layout(
+            height=700 if show_rsi else 580, xaxis_rangeslider_visible=False,
+            font=dict(family="Heebo, Arial, sans-serif", color="#A8BAC2", size=13),
+            hovermode="x unified", dragmode="pan",
+            paper_bgcolor="#0B1216", plot_bgcolor="#0B1216",
+            legend=dict(orientation="h", y=1.045, x=0, bgcolor="rgba(0,0,0,0)",
+                        font=dict(size=11)),
+            margin=dict(l=6, r=104, t=30, b=6),
+            hoverlabel=dict(bgcolor="#131F26", bordercolor="#22333C",
+                            font=dict(family="Heebo", size=12, color="#E9EFF1")))
+        fig.update_xaxes(showgrid=False, linecolor="#22333C", zeroline=False,
+                         tickmode="array", tickvals=tick_idx, ticktext=tick_txt,
+                         tickfont=dict(size=11))
+        fig.update_xaxes(tickmode="array", tickvals=tick_idx, ticktext=tick_txt,
+                         row=rows_n, col=1)
+        fig.update_yaxes(gridcolor="#17242B", zeroline=False, linecolor="#22333C",
+                         tickfont=dict(size=11))
+        fig.update_xaxes(range=[-1, n], row=1, col=1)
+
         st.plotly_chart(fig, use_container_width=True, config={
             "scrollZoom": True, "displaylogo": False,
             "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"],
-            "displayModeBar": True, "responsive": True,
-            "doubleClick": "reset"})
+            "displayModeBar": True, "responsive": True, "doubleClick": "reset",
+            "toImageButtonOptions": {"scale": 2}})
         st.caption("גלגלת העכבר מקרבת ומרחיקה · גרירה מזיזה · לחיצה כפולה מאפסת · "
-                   "בנייד צביטה שתי אצבעות")
+                   "בנייד צביטה בשתי אצבעות. הנתונים כוללים ימי מסחר בלבד — "
+                   "ללא רווחים מלאכותיים בין ימים.")
 
     st.markdown("### אסטרטגיית סוחר יומי — עד 4 ימי מסחר")
     dtp = day_trade_plan(r)
@@ -963,14 +1128,27 @@ if go_:
                 if last_bar is None:
                     last_bar = d.index[-1]
                 A = prep(d)
-                r, why = core(A, len(A["c"]) - 1, C)
-                if r is None:
-                    drop[why] = drop.get(why, 0) + 1
-                    continue
-                sh = int((acct * riskp / 100) / r["risk_share"])
-                r.update(ticker=t, shares=sh, why=why_he(r),
-                         risk_total=round(sh * r["risk_share"], 2))
-                rows.append(r)
+                found_here = []
+                if ptype in ("זינוק ותיקון לתמיכה", "שתי התבניות"):
+                    r, why = core(A, len(A["c"]) - 1, C)
+                    if r is None:
+                        drop[why] = drop.get(why, 0) + 1
+                    else:
+                        r["kind"] = "pullback"
+                        r["why"] = why_he(r)
+                        found_here.append(r)
+                if ptype in ("שבירת תמיכה ותפיסה מחדש", "שתי התבניות"):
+                    rb, whyb = core_breakdown(A, len(A["c"]) - 1, CB)
+                    if rb is None:
+                        drop["שבירה: " + whyb] = drop.get("שבירה: " + whyb, 0) + 1
+                    else:
+                        rb["why"] = why_breakdown(rb)
+                        found_here.append(rb)
+                for r in found_here:
+                    sh = int((acct * riskp / 100) / r["risk_share"])
+                    r.update(ticker=t, shares=sh,
+                             risk_total=round(sh * r["risk_share"], 2))
+                    rows.append(r)
             except Exception:
                 drop["שגיאה"] = drop.get("שגיאה", 0) + 1
         prog.progress((i + 1) / len(batches))
@@ -1042,7 +1220,9 @@ else:
             st.stop()
         if view == "טבלה":
             t = pd.DataFrame([{
-                "מניה": r["ticker"], "יובש נפח": r["dry"], "מחיר": r["price"],
+                "מניה": r["ticker"],
+                "סוג": "שבירה" if r.get("kind") == "breakdown" else "תיקון",
+                "יובש/שבירה": r["dry"], "מחיר": r["price"],
                 "כניסה": r["entry"], "% לכניסה": r["to_entry"], "סטופ": r["stop"],
                 "TP1": r["tp1"], "TP2": r["tp2"], "TP3": r["tp3"], "R:R": r["rr"],
                 "כמות": r["shares"], "סיכון $": r["risk_total"], "ATR $": r["atr"],
@@ -1050,8 +1230,8 @@ else:
                 "בולינג׳ר": ", ".join(r.get("bb", [])) or "—"} for r in rows])
             st.dataframe(t, hide_index=True, use_container_width=True, height=460,
                          column_config={
-                             "יובש נפח": st.column_config.ProgressColumn(
-                                 "יובש נפח", format="%.2f×", min_value=1.0, max_value=2.2),
+                             "יובש/שבירה": st.column_config.ProgressColumn(
+                                 "יובש/שבירה", format="%.2f", min_value=1.0, max_value=2.5),
                              "R:R": st.column_config.ProgressColumn(
                                  "R:R", format="1:%.1f", min_value=0.0, max_value=4.0),
                              "מחיר": st.column_config.NumberColumn(format="$%.2f"),

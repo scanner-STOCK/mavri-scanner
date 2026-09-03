@@ -101,6 +101,12 @@ div[data-testid="stExpander"]{border:1px solid var(--ln);border-radius:4px;backg
 .fn .tr{flex:1;height:16px;background:var(--rz);border-radius:2px;overflow:hidden;}
 .fn .fl{height:100%;background:linear-gradient(90deg,#2C4A57,#3E6B7C);}
 .fn .fl.cut{background:linear-gradient(90deg,#5A2A2E,#8E4046);}
+.fn .fl.worst{background:linear-gradient(90deg,#7A2530,#C13D4A);}
+.fn .row .nm{transition:color .15s;}
+.blocker{direction:rtl;font-size:.76rem;color:var(--dm);margin:-.3rem 0 .9rem;}
+.blocker b{color:var(--sh);font-weight:500;}
+.tc{transition:box-shadow .18s,border-color .18s;}
+.tc:hover{box-shadow:0 4px 22px rgba(0,0,0,.35);border-color:rgba(212,166,75,.28);}
 .fn .vl{width:64px;font-size:.72rem;color:var(--dm);font-variant-numeric:tabular-nums;
         text-align:left;direction:ltr;}
 
@@ -219,13 +225,41 @@ PRESETS = {
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def fetch_full_market():
+    """NASDAQ Trader's official symbol directory — every common stock listed on
+    NASDAQ, NYSE, NYSE American and NYSE Arca. This is the source that gets the
+    universe past a few hundred names into the thousands."""
+    out = []
+    for url, sym_col, etf_col, test_col in [
+        ("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+         "Symbol", "ETF", "Test Issue"),
+        ("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+         "ACT Symbol", "ETF", "Test Issue"),
+    ]:
+        try:
+            txt = requests.get(url, headers=UA, timeout=25).text
+            df = pd.read_csv(io.StringIO(txt), sep="|")
+            df = df[df[test_col].astype(str).str.upper() != "Y"]
+            if etf_col in df.columns:
+                df = df[df[etf_col].astype(str).str.upper() != "Y"]
+            syms = [str(x).strip().upper().replace(".", "-") for x in df[sym_col]]
+            syms = [x for x in syms if x.isascii() and 1 <= len(x) <= 5
+                    and x.replace("-", "").isalpha()]
+            out += syms
+        except Exception:
+            pass
+    return out
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def build_universe(limit):
-    got = []
-    for url, cols in [
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", ("Symbol", "Ticker")),
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", ("Symbol", "Ticker")),
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", ("Symbol", "Ticker")),
-        ("https://en.wikipedia.org/wiki/Nasdaq-100", ("Ticker", "Symbol"))]:
+    got, log = [], []
+    for name, url, cols in [
+        ("S&P500", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", ("Symbol", "Ticker")),
+        ("S&P400", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", ("Symbol", "Ticker")),
+        ("S&P600", "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", ("Symbol", "Ticker")),
+        ("NDX", "https://en.wikipedia.org/wiki/Nasdaq-100", ("Ticker", "Symbol"))]:
+        n0 = 0
         try:
             html = requests.get(url, headers=UA, timeout=25).text
             for tbl in pd.read_html(io.StringIO(html)):
@@ -237,19 +271,28 @@ def build_universe(limit):
                              and x.replace("-", "").isalpha()]
                         if len(s) > 50:
                             got += s
+                            n0 = len(s)
                             hit = True
                         break
                 if hit:
                     break
         except Exception:
             pass
+        log.append(f"{name}:{n0 or '—'}")
+
+    full = fetch_full_market()
+    got += full
+    log.append(f"NASDAQ/NYSE:{len(full) or '—'}")
+
     got += [t.upper() for t in BACKUP]
+    log.append(f"רשימת גיבוי:{len(BACKUP)}")
+
     seen, out = set(), []
     for t in got:
         if t not in seen:
             seen.add(t)
             out.append(t)
-    return out[:limit]
+    return out[:limit], log
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -391,6 +434,7 @@ def core(A, i, C):
                 to_entry=round((entry / px - 1) * 100, 2), rvol=round(rvol, 2),
                 atr=round(a, 2), atr_pct=round(atr_pct, 1), age=int(age),
                 support=round(sup, 2), peak_px=round(pk_px, 2), base=round(lo_px, 2),
+                off_low=round(off_low, 1),
                 bb=tags, spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
 
 
@@ -495,6 +539,7 @@ def core_breakdown(A, i, C):
                 rvol=round(rvol, 2), atr=round(a, 2), atr_pct=round(atr_pct, 1),
                 age=0, rise=round(brk_pct, 1), leg_bars=C["break_win"],
                 dry=round(brk_spike, 2), retrace=round(reclaim_dist, 1), bb=[],
+                off_low=round(reclaim_dist, 1),
                 peak_px=round(resistance, 2), base=round(brk_low, 2),
                 spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
 
@@ -680,18 +725,30 @@ def wl_status(item, d):
 def funnel_html(total, drop):
     order = ["מחזור נמוך", "נפח מניות נמוך", "מחיר נמוך", "השיא ישן מדי", "עוד בשיא",
              "זינוק קטן מדי", "זינוק קצר מדי", "אין מקום לזינוק", "כמעט לא תיקנה",
-             "החזירה את כל הזינוק", "הנפח לא התייבש", "אין נר בולינג׳ר",
-             "ATR נמוך מדי", "תנודתיות נמוכה", "אין מרווח ל-TP1", "היסטוריה קצרה",
-             "אין נתוני נפח", "סטופ לא תקין", "אין ATR", "שגיאה"]
+             "החזירה את כל הזינוק", "הנפח לא התייבש", "רחוקה מדי מהתמיכה",
+             "אין נר בולינג׳ר", "ATR נמוך מדי", "תנודתיות נמוכה", "אין מרווח ל-TP1",
+             "היסטוריה קצרה", "אין נתוני נפח", "סטופ לא תקין", "אין ATR", "שגיאה"]
     items = [(k, drop[k]) for k in order if drop.get(k)]
-    items += [(k, v) for k, v in drop.items() if k not in order and v]
+    items += sorted([(k, v) for k, v in drop.items() if k not in order and v],
+                    key=lambda x: -x[1])
+    items.sort(key=lambda x: -x[1])
     mx = max([v for _, v in items], default=1)
     rows = ""
-    for k, v in items:
-        rows += (f'<div class="row"><div class="nm">{k}</div><div class="tr">'
-                 f'<div class="fl cut" style="width:{v/mx*100:.1f}%"></div></div>'
+    for idx, (k, v) in enumerate(items):
+        worst = idx == 0
+        cls = "cut worst" if worst else "cut"
+        bg = ' style="background:rgba(255,255,255,.015)"' if idx % 2 else ""
+        rows += (f'<div class="row"{bg}><div class="nm">{"⟶ " if worst else ""}{k}</div>'
+                 f'<div class="tr"><div class="fl {cls}" style="width:{v/mx*100:.1f}%"></div></div>'
                  f'<div class="vl">{v:,}</div></div>')
     return f'<div class="fn">{rows}</div>'
+
+
+def top_blocker(drop):
+    if not drop:
+        return None
+    k, v = max(drop.items(), key=lambda x: x[1])
+    return k, v
 
 
 def stat_grid(items):
@@ -809,7 +866,8 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P["sh"]), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 200, 2500, 1500, 100)
+    limit = j4.slider("מספר מניות לסריקה", 200, 6000, 3000, 100,
+                      help="מעל 3000 מוריד יותר נתונים ולוקח יותר זמן לסרוק.")
     k1, k2 = st.columns(2)
     acct = k1.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
     riskp = k2.slider("סיכון לעסקה %", 0.25, 5.0, 0.5, 0.25)
@@ -1107,7 +1165,8 @@ if st.session_state.get("open"):
 
 if go_:
     t0 = time.time()
-    uni = build_universe(limit)
+    uni, uni_log = build_universe(limit)
+    st.caption("יקום: " + " · ".join(uni_log) + f"  →  **{len(uni):,}** מניות ייחודיות")
     prog, note = st.progress(0.0), st.empty()
     rows, drop, liq, last_bar = [], {}, 0, None
     batches = [tuple(uni[i:i + 120]) for i in range(0, len(uni), 120)]
@@ -1194,6 +1253,15 @@ else:
         st.caption("הסריקה הייתה מהירה כי הנתונים כבר היו שמורים מסריקה קודמת "
                    "(נשמרים לשעה). ללחיצה על ↻ תרד הורדה טרייה מהשוק.")
 
+    tb = top_blocker(st.session_state["drop"])
+    if tb:
+        tb_k, tb_v = tb
+        tb_pct = tb_v / max(u, 1) * 100
+        st.markdown(f'<div class="blocker">המסנן שחוסם הכי הרבה מניות: '
+                    f'<b>{tb_k}</b> ({tb_v:,} מניות, {tb_pct:.0f}% מהיקום) — '
+                    f'פרטים מלאים בפאנל "מפל הסינון" למטה.</div>',
+                    unsafe_allow_html=True)
+
     if not rows:
         st.markdown('<div class="empty">אין מניות בתבנית בסינון הזה.<br>'
                     'התבנית נדירה — נסה את הפריסט הרחב לפני שאתה מרפה ידנית.</div>',
@@ -1206,12 +1274,13 @@ else:
         view = v1.radio("תצוגה", ["כרטיסים", "טבלה"], horizontal=True,
                         label_visibility="collapsed")
         srt = v2.selectbox("מיון", ["יובש נפח", "יחס סיכון־סיכוי", "קרוב להפעלה",
-                                    "טרי (ימים מהשיא)", "גודל הזינוק"],
+                                    "הכי קרוב לתמיכה", "טרי (ימים מהשיא)", "גודל הזינוק"],
                            label_visibility="collapsed")
         only_near = v3.checkbox("רק קרובות להפעלה")
         keyf = {"יובש נפח": lambda x: -x["dry"],
                 "יחס סיכון־סיכוי": lambda x: -x["rr"],
                 "קרוב להפעלה": lambda x: x["to_entry"],
+                "הכי קרוב לתמיכה": lambda x: x.get("off_low", 999),
                 "טרי (ימים מהשיא)": lambda x: x["age"],
                 "גודל הזינוק": lambda x: -x["rise"]}[srt]
         rows = sorted(rows, key=keyf)

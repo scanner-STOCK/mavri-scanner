@@ -608,30 +608,38 @@ def rank_verdict(r):
     two separate runs. Above 1.6 was negative in the one large-sample run we have
     (-0.09R, n=28). This ranks by closeness to the PROVEN range, not by raw magnitude —
     a high dry-up number is not automatically better.
+
+    Within a quality tier, freshness breaks near-ties: a pullback whose peak was
+    20 days ago and one whose peak was 41 days ago can have almost identical dry-up
+    (1.43 vs 1.45) — a trivial, meaningless difference — while looking completely
+    different on a chart. Distance-from-center is bucketed to 0.05 so noise-level
+    differences don't decide the ranking; age (ascending, fresher first) does instead.
     """
+    age = r.get("age", 0)
     if r.get("kind") == "breakdown":
-        return dict(tier="?", color="#8A6FB0", sort=(2, 0),
+        return dict(tier="?", color="#8A6FB0", sort=(2, 0, age),
                     headline="לא נבדק היסטורית",
                     detail="תבנית שבירת התמיכה לא עברה עדיין בדיקה היסטורית (backtest) "
                            "כמו תבנית הזינוק-ותיקון. המספרים כאן חושבו נכון, אבל אין לנו "
                            "עדיין הוכחה סטטיסטית שהתבנית הזאת רווחית. התייחס אליה בזהירות "
                            "יתרה עד שתיבדק.")
     dry = r["dry"]
+    dist = abs(dry - 1.45)
+    dist_bucket = round(dist * 20) / 20  # nearest 0.05 — kills 1.43-vs-1.45-style noise
     if 1.30 <= dry <= 1.60:
-        dist = abs(dry - 1.45)
-        return dict(tier="A", color="#2FBF8F", sort=(0, dist),
+        return dict(tier="A", color="#2FBF8F", sort=(0, dist_bucket, age),
                     headline=f"יובש נפח {dry:.2f}× — בדיוק בטווח המוכח",
                     detail=f"יובש הנפח ({dry:.2f}×) נמצא בטווח 1.30–1.60, האזור היחיד שהראה "
                            f"תוחלת חיובית עקבית בבדיקה ההיסטורית (כ-0.25 עד 0.39R לעסקה, "
-                           f"על יותר מ-100 עסקאות בשתי ריצות נפרדות). זו המניה שהמערכת "
-                           f"בוטחת בה הכי הרבה מתוך התוצאות היום.")
+                           f"על יותר מ-100 עסקאות בשתי ריצות נפרדות). בין מניות ברמה הזאת "
+                           f"המערכת מעדיפה את התיקון הטרי ביותר — {age} ימים מהשיא כאן.")
     if (1.10 <= dry < 1.30) or (1.60 < dry <= 2.20):
-        return dict(tier="B", color="#D4A64B", sort=(1, abs(dry - 1.45)),
+        return dict(tier="B", color="#D4A64B", sort=(1, dist_bucket, age),
                     headline=f"יובש נפח {dry:.2f}× — מחוץ לטווח המוכח",
                     detail=f"יובש הנפח ({dry:.2f}×) קרוב לטווח המוכח (1.30–1.60) אך מחוצה לו. "
                            f"אין לנו נתון היסטורי חד-משמעי על הטווח הזה — בריצה אחת הוא "
                            f"הראה תוצאה שלילית, במדגם קטן מדי כדי לקבוע. אפשרי, אך פחות בטוח.")
-    return dict(tier="C", color="#E0605F", sort=(2, abs(dry - 1.45)),
+    return dict(tier="C", color="#E0605F", sort=(2, dist_bucket, age),
                 headline=f"יובש נפח {dry:.2f}× — רחוק מהטווח שנבדק",
                 detail=f"יובש הנפח ({dry:.2f}×) רחוק מהטווח שהוכח (1.30–1.60). "
                        f"{'מתחת לטווח' if dry < 1.10 else 'מעל לטווח'} — במקום שבו בדקנו "
@@ -1510,9 +1518,19 @@ else:
                 "גודל הזינוק": lambda x: -x["rise"]}[srt]
         rows = sorted(rows, key=keyf)
         if srt == "המלצה (מבוסס בדיקה היסטורית)":
-            st.caption("ממוין לפי קרבה לטווח היובש שהוכח רווחי (1.30–1.60), "
-                       "לא לפי גודל המספר. מניה עם יובש 3.5× לא בהכרח טובה יותר "
-                       "ממניה עם 1.45× — לפי הבדיקה ההיסטורית, ההפך נכון לרוב.")
+            has_pullback = any(x.get("kind") != "breakdown" for x in rows)
+            has_breakdown = any(x.get("kind") == "breakdown" for x in rows)
+            if has_pullback and has_breakdown:
+                st.caption("ממוין קודם לפי איכות התבנית (יובש נפח מוכח לעומת שבירת "
+                           "תמיכה שטרם נבדקה), ובתוך כל רמה — לפי טריות התיקון. "
+                           "מספר גבוה יותר של יובש נפח אינו אוטומטית טוב יותר.")
+            elif has_pullback:
+                st.caption("ממוין לפי קרבה לטווח היובש שהוכח רווחי (1.30–1.60), ובתוך "
+                           "הטווח — לפי טריות התיקון. מניה עם יובש 3.5× לא בהכרח טובה "
+                           "יותר ממניה עם 1.45×, וגם לא אם התיקון שלה ישן בהרבה יותר.")
+            else:
+                st.caption("תבנית שבירת התמיכה עדיין לא נבדקה היסטורית — כל התוצאות "
+                           "כאן מסומנות ברמה '?' ומוין רק לפי טריות. התייחס בזהירות.")
         if only_near:
             rows = [x for x in rows if x["to_entry"] <= 1.0]
         if not rows:

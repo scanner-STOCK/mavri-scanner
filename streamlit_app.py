@@ -65,6 +65,8 @@ hr{border-color:var(--ln);}
         font-variant-numeric:tabular-nums;}
 .tc-d span{display:block;font-size:.62rem;color:var(--dm);direction:rtl;}
 .spark svg{width:100%;height:30px;display:block;opacity:.8;}
+.tierchip{font-size:.68rem;padding:.08rem .4rem;border-radius:3px;font-weight:500;letter-spacing:.02em;}
+.verdict-line{font-size:.72rem;font-weight:500;margin:.15rem 0 .1rem;}
 .badges{display:flex;gap:.28rem;flex-wrap:wrap;margin:.35rem 0 0;}
 .chips{display:flex;gap:.28rem;flex-wrap:wrap;margin:.28rem 0 .1rem;}
 .chip{font-size:.62rem;padding:.11rem .4rem;border:1px solid var(--ln);border-radius:2px;color:var(--mu);}
@@ -293,6 +295,9 @@ def build_universe(limit):
         if t not in seen:
             seen.add(t)
             out.append(t)
+    total_available = len(out)
+    if total_available > limit:
+        log.append(f"זמינות בפועל {total_available:,} (מוגבל ל-{limit:,})")
     return out[:limit], log
 
 
@@ -318,21 +323,45 @@ def fetch(tickers, period="1y"):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_one(t, period, interval):
-    """Single ticker, any interval. Returns DataFrame or None."""
-    for attempt in (1, 2):
+    """Single ticker, any interval. Tries two different Yahoo endpoints with
+    backoff before giving up — the two methods sometimes succeed independently
+    of each other when Yahoo is rate-limiting one path."""
+    for attempt in range(3):
         try:
             d = yf.download(t, period=period, interval=interval, auto_adjust=False,
                             progress=False, timeout=45, threads=False)
-            if d is None or len(d) == 0:
-                continue
-            if isinstance(d.columns, pd.MultiIndex):
-                d.columns = d.columns.get_level_values(0)
-            d = d.dropna()
-            if len(d) >= 5:
-                return d
+            if d is not None and len(d):
+                if isinstance(d.columns, pd.MultiIndex):
+                    d.columns = d.columns.get_level_values(0)
+                d = d.dropna()
+                if len(d) >= 5:
+                    return d
         except Exception:
             pass
+        try:
+            d = yf.Ticker(t).history(period=period, interval=interval, auto_adjust=False)
+            if d is not None and len(d):
+                d = d.dropna()
+                if len(d) >= 5:
+                    return d
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(0.6 + attempt * 0.6)
     return None
+
+
+def get_chart_data(r, period_key, interval, ranges):
+    """Prefer the daily data already downloaded during the scan — it's proven
+    to work for this exact ticker. Only reach for a fresh single-ticker fetch
+    when the interval isn't daily or the cached history is too short."""
+    if interval == "1d":
+        cached = r.get("_daily")
+        days_needed = {"3 חודשים": 70, "6 חודשים": 135, "שנה": 260, "שנתיים": 999}
+        need = days_needed.get(period_key, 999)
+        if cached is not None and len(cached) >= min(need, 250):
+            return cached.tail(need) if len(cached) < need else cached.tail(need)
+    return fetch_one(r["ticker"], ranges[period_key], interval)
 
 
 def prep(d):
@@ -565,6 +594,45 @@ def why_he(r):
             f"ונתמכת ב-{r['support']:.2f}")
 
 
+def rank_verdict(r):
+    """
+    Ranking grounded in the walk-forward backtest, not an invented composite score.
+    The ONLY range with repeated, large-sample positive expectancy was dry-up 1.3-1.6
+    (+0.25R to +0.39R across multiple runs, 100+ trades). Below 1.3 was negative in
+    two separate runs. Above 1.6 was negative in the one large-sample run we have
+    (-0.09R, n=28). This ranks by closeness to the PROVEN range, not by raw magnitude —
+    a high dry-up number is not automatically better.
+    """
+    if r.get("kind") == "breakdown":
+        return dict(tier="?", color="#8A6FB0", sort=(2, 0),
+                    headline="לא נבדק היסטורית",
+                    detail="תבנית שבירת התמיכה לא עברה עדיין בדיקה היסטורית (backtest) "
+                           "כמו תבנית הזינוק-ותיקון. המספרים כאן חושבו נכון, אבל אין לנו "
+                           "עדיין הוכחה סטטיסטית שהתבנית הזאת רווחית. התייחס אליה בזהירות "
+                           "יתרה עד שתיבדק.")
+    dry = r["dry"]
+    if 1.30 <= dry <= 1.60:
+        dist = abs(dry - 1.45)
+        return dict(tier="A", color="#2FBF8F", sort=(0, dist),
+                    headline=f"יובש נפח {dry:.2f}× — בדיוק בטווח המוכח",
+                    detail=f"יובש הנפח ({dry:.2f}×) נמצא בטווח 1.30–1.60, האזור היחיד שהראה "
+                           f"תוחלת חיובית עקבית בבדיקה ההיסטורית (כ-0.25 עד 0.39R לעסקה, "
+                           f"על יותר מ-100 עסקאות בשתי ריצות נפרדות). זו המניה שהמערכת "
+                           f"בוטחת בה הכי הרבה מתוך התוצאות היום.")
+    if (1.10 <= dry < 1.30) or (1.60 < dry <= 2.20):
+        return dict(tier="B", color="#D4A64B", sort=(1, abs(dry - 1.45)),
+                    headline=f"יובש נפח {dry:.2f}× — מחוץ לטווח המוכח",
+                    detail=f"יובש הנפח ({dry:.2f}×) קרוב לטווח המוכח (1.30–1.60) אך מחוצה לו. "
+                           f"אין לנו נתון היסטורי חד-משמעי על הטווח הזה — בריצה אחת הוא "
+                           f"הראה תוצאה שלילית, במדגם קטן מדי כדי לקבוע. אפשרי, אך פחות בטוח.")
+    return dict(tier="C", color="#E0605F", sort=(2, abs(dry - 1.45)),
+                headline=f"יובש נפח {dry:.2f}× — רחוק מהטווח שנבדק",
+                detail=f"יובש הנפח ({dry:.2f}×) רחוק מהטווח שהוכח (1.30–1.60). "
+                       f"{'מתחת לטווח' if dry < 1.10 else 'מעל לטווח'} — במקום שבו בדקנו "
+                       f"היסטורית, התוצאה הייתה שלילית. מספר גבוה או נמוך יותר אינו "
+                       f"אוטומטית טוב יותר; זה בדיוק הטעות שגילינו והפכה אותנו לזהירים.")
+
+
 def sparkline(vals):
     if not vals or len(vals) < 3:
         return ""
@@ -596,6 +664,9 @@ def ladder(r):
 
 
 def card(r, best=False, watched=False, triggered=False, aging=False):
+    tier = r.get("tier") or rank_verdict(r)["tier"]
+    tcolor = r.get("tier_color") or rank_verdict(r)["color"]
+    vheadline = r.get("verdict_headline") or rank_verdict(r)["headline"]
     ch = "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
     ch += f'<span class="chip">ATR {r["atr"]:.2f}$ · RVOL {r["rvol"]:.2f}</span>'
     near = r["to_entry"] <= 1.0
@@ -623,8 +694,11 @@ def card(r, best=False, watched=False, triggered=False, aging=False):
         sub_lab, sub_val = "ימים מהשיא", str(r["age"])
     badge_row = f'<div class="badges">{badges}</div>' if badges else ""
     return f"""<div class="tc{' top' if best else ''}{' near' if near and not triggered else ''}">
-<div class="tc-h"><div class="tc-s">{r['ticker']}</div>
-<div class="tc-d"><b>{head_val}</b><span>{head_lab}</span></div></div>
+<div class="tc-h"><div style="display:flex;align-items:baseline;gap:.5rem">
+<div class="tc-s">{r['ticker']}</div>
+<span class="tierchip" style="background:{tcolor}22;color:{tcolor};border:1px solid {tcolor}55">רמה {tier}</span>
+</div><div class="tc-d"><b>{head_val}</b><span>{head_lab}</span></div></div>
+<div class="verdict-line" style="color:{tcolor}">{vheadline}</div>
 {sparkline(r.get('spark', []))}{badge_row}<div class="chips">{ch}</div>{ladder(r)}
 <div class="tl"><span>{int(r['shares'])} מניות · סיכון <b>${r['risk_total']:.0f}</b></span>
 <span>יחס <b>1:{r['rr']:.1f}</b></span></div>
@@ -906,8 +980,9 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P["sh"]), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 200, 6000, 3000, 100,
-                      help="מעל 3000 מוריד יותר נתונים ולוקח יותר זמן לסרוק.")
+    limit = j4.slider("מספר מניות לסריקה", 200, 10000, 4000, 100,
+                      help="מעל 4000 לוקח משמעותית יותר זמן להוריד. "
+                           "המספר האמיתי הזמין מוצג אחרי הסריקה.")
     k1, k2 = st.columns(2)
     acct = k1.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
     riskp = k2.slider("סיכון לעסקה %", 0.25, 5.0, 0.5, 0.25)
@@ -995,6 +1070,21 @@ if st.session_state.get("open"):
         wl_toggle(r)
         st.rerun()
 
+    v_ = rank_verdict(r)
+    st.markdown(f"""<div style="direction:rtl;display:flex;align-items:center;gap:.9rem;
+    margin:.8rem 0 1rem;padding:.85rem 1rem;background:var(--pan);border:1px solid var(--ln);
+    border-right:4px solid {v_['color']};border-radius:5px">
+    <div style="font-family:'Frank Ruhl Libre',serif;font-size:1.9rem;font-weight:700;
+    color:{v_['color']}">{r['ticker']}</div>
+    <div style="width:1px;align-self:stretch;background:var(--ln)"></div>
+    <div style="flex:1">
+      <div style="font-size:.95rem;color:{v_['color']};font-weight:500">רמה {v_['tier']} — {v_['headline']}</div>
+      <div style="font-size:.8rem;color:var(--dm);margin-top:.15rem">{r['why']}</div>
+    </div></div>""", unsafe_allow_html=True)
+    with st.expander("למה זה הדירוג — הסבר מפורט"):
+        st.markdown(f'<div class="tw" style="font-size:.85rem;line-height:1.8">{v_["detail"]}</div>',
+                   unsafe_allow_html=True)
+
     INTERVALS = {
         "יומי": ("1d", {"3 חודשים": "3mo", "6 חודשים": "6mo", "שנה": "1y", "שנתיים": "2y"}),
         "שבועי": ("1wk", {"שנה": "1y", "שנתיים": "2y", "5 שנים": "5y", "10 שנים": "10y"}),
@@ -1013,7 +1103,7 @@ if st.session_state.get("open"):
                           default=["בולינג׳ר", "SMA20", "SMA50", "רמות עסקה", "אזורי תבנית"])
     show_rsi = cc4.checkbox("RSI", value=True)
 
-    v = fetch_one(r["ticker"], ranges[per], iv)
+    v = get_chart_data(r, per, iv, ranges)
     if v is None:
         st.error(f"לא הצלחתי להוריד נתונים ל-{r['ticker']} בטווח הזה. "
                  "אינטרוול תוך-יומי מוגבל בהיסטוריה — נסה טווח קצר יותר, או נרות יומיים.")
@@ -1118,7 +1208,7 @@ if st.session_state.get("open"):
             paper_bgcolor="#0B1216", plot_bgcolor="#0B1216",
             legend=dict(orientation="h", y=1.045, x=0, bgcolor="rgba(0,0,0,0)",
                         font=dict(size=11)),
-            margin=dict(l=6, r=104, t=30, b=6),
+            margin=dict(l=6, r=118, t=30, b=6),
             hoverlabel=dict(bgcolor="#131F26", bordercolor="#22333C",
                             font=dict(family="Heebo", size=12, color="#E9EFF1")))
         fig.update_xaxes(showgrid=False, linecolor="#22333C", zeroline=False,
@@ -1127,8 +1217,11 @@ if st.session_state.get("open"):
         fig.update_xaxes(tickmode="array", tickvals=tick_idx, ticktext=tick_txt,
                          row=rows_n, col=1)
         fig.update_yaxes(gridcolor="#17242B", zeroline=False, linecolor="#22333C",
-                         tickfont=dict(size=11))
+                         tickfont=dict(size=11), side="right")
         fig.update_xaxes(range=[-1, n], row=1, col=1)
+        fig.add_annotation(text="MAVRI", x=0.01, y=0.06, xref="paper", yref="paper",
+                          showarrow=False, font=dict(size=22, color="rgba(147,168,178,.07)",
+                                                     family="Frank Ruhl Libre"))
 
         st.plotly_chart(fig, use_container_width=True, config={
             "scrollZoom": True, "displaylogo": False,
@@ -1139,66 +1232,67 @@ if st.session_state.get("open"):
                    "בנייד צביטה בשתי אצבעות. הנתונים כוללים ימי מסחר בלבד — "
                    "ללא רווחים מלאכותיים בין ימים.")
 
-    st.markdown("### אסטרטגיית סוחר יומי — עד 4 ימי מסחר")
+    st.markdown("### תוכנית מסחר — עד 4 ימים")
     dtp = day_trade_plan(r)
     dt_shares = int((acct * riskp / 100) / dtp["risk"]) if dtp["risk"] > 0 else 0
-    st.markdown(stat_grid([
-        ("כניסה", f"${dtp['entry']:.2f}", "gd"),
-        ("סטופ צר", f"${dtp['stop']:.2f}", "dn"),
-        ("סיכון למניה", f"${dtp['risk']:.2f}", ""),
-        ("T1 (יום 1-2)", f"${dtp['t1']:.2f}", "up"),
-        ("T2 (יום 2-3)", f"${dtp['t2']:.2f}", "up"),
-        ("T3 (יום 3-4)", f"${dtp['t3']:.2f}", "up"),
-        ("R:R ל-T1", f"1:{dtp['rr1']:.1f}", ""),
-        ("R:R ל-T2", f"1:{dtp['rr2']:.1f}", ""),
-        ("R:R ל-T3", f"1:{dtp['rr3']:.1f}", ""),
-        ("כמות מניות", f"{dt_shares:,}", ""),
-    ]), unsafe_allow_html=True)
-    st.markdown(f"""<div class="tw" style="font-size:.82rem;line-height:1.85">
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("כניסה", f"${dtp['entry']:.2f}")
+    m2.metric("סטופ", f"${dtp['stop']:.2f}", f"-${dtp['risk']:.2f}/מניה", delta_color="off")
+    m3.metric("יעד ראשון", f"${dtp['t1']:.2f}", f"1:{dtp['rr1']:.1f}")
+    m4.metric("כמות מניות", f"{dt_shares:,}", f"סיכון ${round(dt_shares*dtp['risk']):,}",
+              delta_color="off")
+    st.markdown(f"""<div class="tw" style="font-size:.83rem;line-height:1.9">
 <b style="color:var(--tx)">יום 1</b> — ממתינים להפעלה: פריצה מעל {ltr(f"${dtp['entry']:.2f}")} בנפח מוגבר. לא הופעל? לא נוגעים.<br>
-<b style="color:var(--tx)">יום 1–2</b> — לאחר הפעלה, סטופ קבוע ב-{ltr(f"${dtp['stop']:.2f}")}. הגעה ל-T1 → מוכרים שליש, מעלים סטופ לכניסה.<br>
-<b style="color:var(--tx)">יום 2–3</b> — הגעה ל-T2 → מוכרים שליש נוסף, סטופ עוקב מתחת לשפל היום הקודם.<br>
-<b style="color:var(--tx)">יום 3–4</b> — יתרה ל-T3 או יציאה ידנית. <span style="color:var(--sh)">לא הופעל תוך 4 ימי מסחר → מבטלים את ההגדרה, התבנית נחשבת שהתיישנה.</span>
+<b style="color:var(--tx)">יום 1–2</b> — לאחר הפעלה, סטופ קבוע ב-{ltr(f"${dtp['stop']:.2f}")}. הגעה ל-{ltr(f"${dtp['t1']:.2f}")} (T1) → מוכרים שליש, מעלים סטופ לכניסה.<br>
+<b style="color:var(--tx)">יום 2–3</b> — הגעה ל-{ltr(f"${dtp['t2']:.2f}")} (T2) → מוכרים שליש נוסף, סטופ עוקב מתחת לשפל היום הקודם.<br>
+<b style="color:var(--tx)">יום 3–4</b> — יתרה ל-{ltr(f"${dtp['t3']:.2f}")} (T3) או יציאה ידנית.
+<span style="color:var(--sh)">לא הופעל תוך 4 ימי מסחר → מבטלים, התבנית התיישנה.</span>
 </div>""", unsafe_allow_html=True)
+    st.code(f"{r['ticker']}\n"
+            f"BUY STOP {dt_shares} @ {dtp['entry']:.2f}\n"
+            f"STOP {dtp['stop']:.2f}\n"
+            f"T1 {dtp['t1']:.2f}  ·  T2 {dtp['t2']:.2f}  ·  T3 {dtp['t3']:.2f}\n"
+            f"בטל אם לא הופעל תוך 4 ימי מסחר", language=None)
 
-    st.markdown("### מפת הסיכון — עסקת סווינג המלאה")
-    st.markdown(rmap(r), unsafe_allow_html=True)
+    with st.expander("תוכנית סווינג מלאה — למי שרוצה להחזיק מעבר ל-4 ימים"):
+        st.markdown(rmap(r), unsafe_allow_html=True)
+        q1, q2 = st.columns(2)
+        with q1:
+            st.code(f"{r['ticker']}\n"
+                    f"BUY STOP {int(r['shares'])} @ {r['entry']:.2f}\n"
+                    f"STOP {r['stop']:.2f}\n"
+                    f"TP1 {r['tp1']:.2f}  ·  TP2 {r['tp2']:.2f}  ·  TP3 {r['tp3']:.2f}",
+                    language=None)
+        with q2:
+            st.markdown(stat_grid([
+                ("כמות מניות", f"{int(r['shares']):,}", ""),
+                ("שווי פוזיציה", f"${r['shares']*r['entry']:,.0f}", ""),
+                ("סיכון", f"${r['risk_total']:,.0f}", "dn"),
+                ("רווח ב-TP1", f"${r['shares']*(r['tp1']-r['entry']):,.0f}", "up"),
+                ("רווח ב-TP3", f"${r['shares']*(r['tp3']-r['entry']):,.0f}", "up"),
+            ]), unsafe_allow_html=True)
+        st.caption("שתי התוכניות משתמשות באותה נקודת כניסה. ההבדל הוא מרחק הסטופ "
+                   "והיעדים — התוכנית היומית מהודקת ל-ATR לטווח של ימים.")
 
-    q1, q2 = st.columns([1, 1])
-    with q1:
-        st.markdown("##### תוכנית סווינג (TP1–TP3 מלאים)")
-        st.code(f"{r['ticker']}\n"
-                f"BUY STOP {int(r['shares'])} @ {r['entry']:.2f}\n"
-                f"STOP {r['stop']:.2f}\n"
-                f"TP1 {r['tp1']:.2f}  ·  TP2 {r['tp2']:.2f}  ·  TP3 {r['tp3']:.2f}",
-                language=None)
-        st.markdown("##### תוכנית יום (4 ימים)")
-        st.code(f"{r['ticker']}\n"
-                f"BUY STOP {dt_shares} @ {dtp['entry']:.2f}\n"
-                f"STOP {dtp['stop']:.2f}\n"
-                f"T1 {dtp['t1']:.2f}  ·  T2 {dtp['t2']:.2f}  ·  T3 {dtp['t3']:.2f}\n"
-                f"בטל אם לא הופעל תוך 4 ימי מסחר",
-                language=None)
-    with q2:
-        st.markdown("##### כסף — סווינג")
-        st.markdown(stat_grid([
-            ("כמות מניות", f"{int(r['shares']):,}", ""),
-            ("שווי פוזיציה", f"${r['shares']*r['entry']:,.0f}", ""),
-            ("סיכון", f"${r['risk_total']:,.0f}", "dn"),
-            ("רווח ב-TP1", f"${r['shares']*(r['tp1']-r['entry']):,.0f}", "up"),
-            ("רווח ב-TP3", f"${r['shares']*(r['tp3']-r['entry']):,.0f}", "up"),
-            ("סיכון למניה", f"${r['risk_share']:.2f}", ""),
-        ]), unsafe_allow_html=True)
-        st.markdown("##### כסף — 4 ימים")
-        st.markdown(stat_grid([
-            ("כמות מניות", f"{dt_shares:,}", ""),
-            ("סיכון", f"${round(dt_shares*dtp['risk']):,}", "dn"),
-            ("רווח ב-T1", f"${round(dt_shares*(dtp['t1']-dtp['entry'])):,}", "up"),
-            ("רווח ב-T3", f"${round(dt_shares*(dtp['t3']-dtp['entry'])):,}", "up"),
-        ]), unsafe_allow_html=True)
-
-    st.caption("שתי התוכניות משתמשות באותה נקודת כניסה. ההבדל הוא מרחק הסטופ והיעדים — "
-               "התוכנית היומית מהודקת ל-ATR כדי להתאים לטווח זמן של ימים ולא שבועות.")
+    with st.expander("נתוני התבנית המלאים"):
+        if r.get("kind") == "breakdown":
+            st.markdown(stat_grid([
+                ("שבירה", f"{r['brk_pct']:.1f}%", ""), ("נפח שבירה", f"{r['spike']:.2f}×", ""),
+                ("תפיסה מחדש", f"{r['reclaim_pct']:+.1f}%", ""),
+                ("תמיכה", f"${r['support']:.2f}", ""), ("התנגדות", f"${r['resistance']:.2f}", ""),
+                ("ATR", f"${r['atr']:.2f}", ""), ("ATR %", f"{r['atr_pct']:.1f}%", ""),
+                ("RVOL", f"{r['rvol']:.2f}", ""),
+            ]), unsafe_allow_html=True)
+        else:
+            st.markdown(stat_grid([
+                ("יובש נפח", f"{r['dry']:.2f}×", "gd"), ("נפח בזינוק", f"{r['spike']:.2f}×", ""),
+                ("זינוק", f"+{r['rise']:.0f}%", "up"), ("ימי זינוק", f"{r['leg_bars']}", ""),
+                ("תיקון", f"{r['retrace']:.0f}%", ""), ("ימים מהשיא", f"{r['age']}", ""),
+                ("ATR", f"${r['atr']:.2f}", ""), ("ATR %", f"{r['atr_pct']:.1f}%", ""),
+                ("RVOL", f"{r['rvol']:.2f}", ""), ("R:R ל-TP1", f"1:{r['rr']:.1f}", "gd"),
+                ("R:R ל-TP3", f"1:{r['rr3']:.1f}", ""),
+                ("בולינג׳ר", ", ".join(r.get("bb", [])) or "—", ""),
+            ]), unsafe_allow_html=True)
     st.stop()
 
 # ---------------------------------------------------------------- scan
@@ -1248,14 +1342,20 @@ if go_:
                 for r in found_here:
                     sh = int((acct * riskp / 100) / r["risk_share"])
                     r.update(ticker=t, shares=sh,
-                             risk_total=round(sh * r["risk_share"], 2))
+                             risk_total=round(sh * r["risk_share"], 2),
+                             _daily=d.tail(300).copy())
                     rows.append(r)
             except Exception:
                 drop["שגיאה"] = drop.get("שגיאה", 0) + 1
         prog.progress((i + 1) / len(batches))
     prog.empty()
     note.empty()
-    rows.sort(key=lambda x: -x["dry"])
+    for r in rows:
+        v_ = rank_verdict(r)
+        r["tier"], r["tier_color"] = v_["tier"], v_["color"]
+        r["verdict_headline"], r["verdict_detail"] = v_["headline"], v_["detail"]
+        r["_sort"] = v_["sort"]
+    rows.sort(key=lambda x: x["_sort"])
     st.session_state.update(
         rows=rows, stats=(len(uni), liq), drop=drop, open=None,
         scanned_at=datetime.now(il).strftime("%H:%M"),
@@ -1307,23 +1407,31 @@ else:
                     'התבנית נדירה — נסה את הפריסט הרחב לפני שאתה מרפה ידנית.</div>',
                     unsafe_allow_html=True)
         with st.expander("מפל הסינון — איפה המניות נפלו", expanded=True):
-            st.markdown(funnel_html(u, st.session_state["drop"]), unsafe_allow_html=True)
+            fc = funnel_chart(st.session_state["drop"])
+            if fc:
+                st.plotly_chart(fc, use_container_width=True, config={"displayModeBar": False})
             st.caption("השורה הארוכה ביותר היא המסנן שחוסם הכי הרבה. הרפה אותו ראשון.")
     else:
         v1, v2, v3 = st.columns([1.4, 1.6, 1])
         view = v1.radio("תצוגה", ["כרטיסים", "טבלה"], horizontal=True,
                         label_visibility="collapsed")
-        srt = v2.selectbox("מיון", ["יובש נפח", "יחס סיכון־סיכוי", "קרוב להפעלה",
-                                    "הכי קרוב לתמיכה", "טרי (ימים מהשיא)", "גודל הזינוק"],
+        srt = v2.selectbox("מיון", ["המלצה (מבוסס בדיקה היסטורית)", "יובש נפח",
+                                    "יחס סיכון־סיכוי", "קרוב להפעלה", "הכי קרוב לתמיכה",
+                                    "טרי (ימים מהשיא)", "גודל הזינוק"],
                            label_visibility="collapsed")
         only_near = v3.checkbox("רק קרובות להפעלה")
-        keyf = {"יובש נפח": lambda x: -x["dry"],
+        keyf = {"המלצה (מבוסס בדיקה היסטורית)": lambda x: x.get("_sort", (9, 0)),
+                "יובש נפח": lambda x: -x["dry"],
                 "יחס סיכון־סיכוי": lambda x: -x["rr"],
                 "קרוב להפעלה": lambda x: x["to_entry"],
                 "הכי קרוב לתמיכה": lambda x: x.get("off_low", 999),
                 "טרי (ימים מהשיא)": lambda x: x["age"],
                 "גודל הזינוק": lambda x: -x["rise"]}[srt]
         rows = sorted(rows, key=keyf)
+        if srt == "המלצה (מבוסס בדיקה היסטורית)":
+            st.caption("ממוין לפי קרבה לטווח היובש שהוכח רווחי (1.30–1.60), "
+                       "לא לפי גודל המספר. מניה עם יובש 3.5× לא בהכרח טובה יותר "
+                       "ממניה עם 1.45× — לפי הבדיקה ההיסטורית, ההפך נכון לרוב.")
         if only_near:
             rows = [x for x in rows if x["to_entry"] <= 1.0]
         if not rows:
@@ -1391,9 +1499,12 @@ else:
                             st.rerun()
 
         with st.expander("מפל הסינון — איפה המניות נפלו"):
-            st.markdown(funnel_html(u, st.session_state["drop"]), unsafe_allow_html=True)
+            fc = funnel_chart(st.session_state["drop"])
+            if fc:
+                st.plotly_chart(fc, use_container_width=True, config={"displayModeBar": False})
 
-        df = pd.DataFrame([{k: v for k, v in r.items() if k != "spark"} for r in rows])
+        df = pd.DataFrame([{k: v for k, v in r.items() if k not in ("spark", "_daily")}
+                           for r in rows])
         z1, z2 = st.columns(2)
         z1.download_button("הורד CSV", df.to_csv(index=False),
                            f"mavri_{datetime.now():%Y%m%d}.csv", "text/csv",

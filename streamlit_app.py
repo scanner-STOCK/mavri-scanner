@@ -224,12 +224,12 @@ SE MELI GRAB CPNG STNE PAGS VIST GGAL BMA PAM YPF TS TX
 
 PRESETS = {
     "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", bbmode="בונוס", price=10.0, dv=15.0,
-                       sh=0.3, atr=1.0, atrp=2.0, rise=12, age=(3, 45), retr=(20, 70),
+                       sh=0.3, atr=1.0, atrp=2.0, rise=12, age=(3, 20), retr=(20, 70),
                        rr=1.5, off=12),
     "רחב": dict(dry=1.05, bb="אחת מהשתיים", bbmode="בונוס", price=5.0, dv=8.0, sh=0.2,
-                atr=0.4, atrp=1.5, rise=6, age=(2, 60), retr=(12, 88), rr=1.0, off=20),
+                atr=0.4, atrp=1.5, rise=6, age=(2, 35), retr=(12, 88), rr=1.0, off=20),
     "מחמיר": dict(dry=1.45, bb="רצועה תחתונה", bbmode="חובה", price=15.0, dv=40.0, sh=1.0,
-                  atr=1.5, atrp=3.0, rise=20, age=(3, 25), retr=(30, 65), rr=2.0, off=8),
+                  atr=1.5, atrp=3.0, rise=20, age=(3, 15), retr=(30, 65), rr=2.0, off=8),
 }
 
 
@@ -380,7 +380,8 @@ def prep(d):
     mid, sd = cs.rolling(20).mean(), cs.rolling(20).std()
     return dict(c=c, o=o, h=h, l=l, v=v,
                 atr=pd.Series(tr).rolling(14).mean().values,
-                bbu=(mid + 2 * sd).values, bbl=(mid - 2 * sd).values)
+                bbu=(mid + 2 * sd).values, bbl=(mid - 2 * sd).values,
+                sma200=cs.rolling(200).mean().values)
 
 
 def bb_hits(A, i, look, side):
@@ -460,6 +461,16 @@ def core(A, i, C):
     if atr_pct < C["atr_pct"]:
         return None, "תנודתיות נמוכה"
     rvol = float(v[i - 2:i + 1].mean() / v[max(0, i - 49):i + 1].mean())
+    sma200 = float(A["sma200"][i]) if np.isfinite(A["sma200"][i]) else None
+    above200 = None if sma200 is None else (px > sma200)
+    if C.get("trend_hard") and sma200 is not None and not above200:
+        return None, "מתחת ל-SMA200"
+    rs = None
+    if C.get("spy_ret21") is not None and i >= 21:
+        stock_ret21 = (c[i] / c[i - 21] - 1) * 100
+        rs = stock_ret21 - C["spy_ret21"]
+        if C.get("rs_min") is not None and rs < C["rs_min"]:
+            return None, "חלשה מדי מול השוק"
     entry = max(px, float(h[i])) + .05 * a
     stop = max(min(sup - .35 * a, entry - 3 * a), entry - 4 * a)
     risk = entry - stop
@@ -478,8 +489,34 @@ def core(A, i, C):
                 to_entry=round((entry / px - 1) * 100, 2), rvol=round(rvol, 2),
                 atr=round(a, 2), atr_pct=round(atr_pct, 1), age=int(age),
                 support=round(sup, 2), peak_px=round(pk_px, 2), base=round(lo_px, 2),
-                off_low=round(off_low, 1),
+                off_low=round(off_low, 1), above200=above200,
+                rs=(round(rs, 1) if rs is not None else None),
                 bb=tags, spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def days_to_earnings(ticker):
+    """Trading-unaware calendar days until the next known earnings date, or None
+    if unavailable. Only ever called on the small matched subset — never on the
+    full scanned universe — because this is one extra network call per ticker."""
+    try:
+        t = yf.Ticker(ticker)
+        try:
+            ed = t.get_earnings_dates(limit=4)
+            if ed is not None and len(ed):
+                future = [d for d in ed.index if d.date() >= datetime.now().date()]
+                if future:
+                    return (min(future).date() - datetime.now().date()).days
+        except Exception:
+            pass
+        cal = t.calendar
+        if isinstance(cal, dict) and cal.get("Earnings Date"):
+            dts = cal["Earnings Date"]
+            dt = dts[0] if isinstance(dts, (list, tuple)) else dts
+            return (dt - datetime.now().date()).days
+    except Exception:
+        pass
+    return None
 
 
 def ltr(txt):
@@ -556,6 +593,17 @@ def core_breakdown(A, i, C):
     if C["need_trig"] and green_now == 0:
         return None, "אין נר היפוך"
 
+    sma200 = float(A["sma200"][i]) if np.isfinite(A["sma200"][i]) else None
+    above200 = None if sma200 is None else (px > sma200)
+    if C.get("trend_hard") and sma200 is not None and not above200:
+        return None, "מתחת ל-SMA200"
+    rs = None
+    if C.get("spy_ret21") is not None and i >= 21:
+        stock_ret21 = (c[i] / c[i - 21] - 1) * 100
+        rs = stock_ret21 - C["spy_ret21"]
+        if C.get("rs_min") is not None and rs < C["rs_min"]:
+            return None, "חלשה מדי מול השוק"
+
     entry = max(px, float(h[i])) + .05 * a
     stop = min(brk_low - .3 * a, entry - 2.2 * a)
     risk = entry - stop
@@ -581,6 +629,7 @@ def core_breakdown(A, i, C):
                 rr=round(float(rr), 2), rr3=round(float((t3 - entry) / risk), 2),
                 risk_share=round(float(risk), 2), to_entry=round((entry / px - 1) * 100, 2),
                 rvol=round(rvol, 2), atr=round(a, 2), atr_pct=round(atr_pct, 1),
+                above200=above200, rs=(round(rs, 1) if rs is not None else None),
                 age=0, rise=round(brk_pct, 1), leg_bars=C["break_win"],
                 dry=round(brk_spike, 2), retrace=round(reclaim_dist, 1), bb=[],
                 off_low=round(reclaim_dist, 1),
@@ -695,6 +744,23 @@ def explain_ai(r, rank=None, total=None):
     if liq:
         parts.append(" · ".join(liq) + ".")
 
+    extra = []
+    if r.get("above200") is True:
+        extra.append("נסחרת מעל ה-SMA200, כלומר בתוך מגמת עלייה ארוכת טווח")
+    elif r.get("above200") is False:
+        extra.append("נסחרת מתחת ל-SMA200 — נגד המגמה הארוכה, סימן אזהרה קל")
+    if r.get("rs") is not None:
+        rs_txt = "חזקה מהמדד" if r["rs"] > 0 else "חלשה מהמדד"
+        rs_abs_txt = ltr(f"{abs(r['rs']):.1f}%")
+        extra.append(f"{rs_txt} ב-{rs_abs_txt} על פני החודש האחרון (RS)")
+    if extra:
+        parts.append(" · ".join(extra) + ". שים לב: שני הגורמים האלה — מגמה וחוזק "
+                     "יחסי — לא נבדקו עדיין בבדיקה היסטורית במערכת הזאת, בניגוד "
+                     "ליובש הנפח. הם היגיון מקובל במסחר, לא הוכחה.")
+    if r.get("earn_days") is not None:
+        parts.append(f"⚠ שים לב: דוח רבעוני צפוי בעוד {r['earn_days']} ימים — "
+                     f"תוך כדי חלון ההחזקה המתוכנן. שקול לצאת לפני הדוח או להקטין גודל פוזיציה.")
+
     waiting = r["to_entry"] > 0.3
     wait_txt = "עדיין ממתינים לפריצה" if waiting else "קרוב מאוד להפעלה כרגע"
     parts.append(
@@ -754,8 +820,19 @@ def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, 
                     f'<span>{f"/{total}" if total else ""}</span></div>')
     ch = "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
     ch += f'<span class="chip">ATR {r["atr"]:.2f}$ · RVOL {r["rvol"]:.2f}</span>'
+    if r.get("rs") is not None:
+        ch += f'<span class="chip">RS {r["rs"]:+.1f}%</span>'
     near = r["to_entry"] <= 1.0
     badges = ""
+    if r.get("above200"):
+        badges += ('<span class="badge" style="background:rgba(74,143,176,.16);'
+                   'color:#6FB2D9">מעל SMA200</span>')
+    if r.get("rs") is not None and r["rs"] > 0:
+        badges += ('<span class="badge" style="background:rgba(47,191,143,.14);'
+                   'color:var(--lg)">חזקה מהשוק</span>')
+    if r.get("earn_days") is not None:
+        badges += ('<span class="badge" style="background:rgba(224,96,95,.16);'
+                   f'color:var(--sh)">⚠ דוח בעוד {r["earn_days"]} ימים</span>')
     if watched:
         badges += ('<span class="badge" style="background:rgba(212,166,75,.18);'
                    'color:var(--gd)">★ מעקב</span>')
@@ -1068,6 +1145,19 @@ with st.expander("סינון מתקדם"):
     limit = j4.slider("מספר מניות לסריקה", 200, 10000, 4000, 100,
                       help="מעל 4000 לוקח משמעותית יותר זמן להוריד. "
                            "המספר האמיתי הזמין מוצג אחרי הסריקה.")
+
+    st.markdown("##### מגמה, חוזק יחסי ודוחות — עדיין לא נבדקו בבדיקה היסטורית")
+    p1, p2, p3, p4 = st.columns(4)
+    trend_hard = p1.checkbox("דרוש מעל SMA200", value=False,
+                             help="לסחור רק תיקונים בתוך מגמת עלייה ארוכת טווח. "
+                                  "היגיון סטנדרטי במסחר, אך לא נבדק עדיין במערכת הזאת.")
+    use_rs = p2.checkbox("דרוש חוזק מול השוק", value=False,
+                         help="RS מול SPY חיובי — המנייה עלתה יותר מהמדד בחודש האחרון.")
+    rs_min_val = p3.number_input("RS מינימלי %", -20.0, 20.0, 0.0, 1.0, disabled=not use_rs)
+    earn_days = p4.number_input("הרחק מדוח (ימים)", 0, 30, 5, 1,
+                                help="0 מכבה. בודק רק את המניות שכבר עברו את שאר "
+                                     "הסינון — לא כל היקום, כדי לא להאט את הסריקה.")
+
     k1, k2 = st.columns(2)
     acct = k1.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
     riskp = k2.slider("סיכון לעסקה %", 0.25, 5.0, 0.5, 0.25)
@@ -1075,13 +1165,15 @@ with st.expander("סינון מתקדם"):
 C = dict(leg_min=leg_min, leg_max=leg_max, rise_min=rise_min, retr_lo=retr[0],
          retr_hi=retr[1], age_lo=agev[0], age_hi=agev[1], atr_pct=atr_pct,
          atr_abs=atr_abs, rr_min=rr_min, dry_min=dry_min, bb_look=bb_look, win=win,
-         off_max=off_max, bb_hard=(bbmode == "חובה"),
+         off_max=off_max, bb_hard=(bbmode == "חובה"), trend_hard=trend_hard,
+         rs_min=(rs_min_val if use_rs else None),
          bb={"כבוי": "off", "רצועה תחתונה": "lower",
              "רצועה עליונה": "upper", "אחת מהשתיים": "both"}[bb_lbl])
 
 CB = dict(win=win, sup_win=sup_win, break_win=break_win, break_min=break_min,
           break_max=break_max, reclaim_lo=reclaim_lo, reclaim_hi=reclaim_hi,
-          atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min, need_trig=need_trig_b)
+          atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min, need_trig=need_trig_b,
+          trend_hard=trend_hard, rs_min=(rs_min_val if use_rs else None))
 
 # ---------------------------------------------------------------- detail
 
@@ -1371,6 +1463,9 @@ if st.session_state.get("open"):
                 ("תמיכה", f"${r['support']:.2f}", ""), ("התנגדות", f"${r['resistance']:.2f}", ""),
                 ("ATR", f"${r['atr']:.2f}", ""), ("ATR %", f"{r['atr_pct']:.1f}%", ""),
                 ("RVOL", f"{r['rvol']:.2f}", ""),
+                ("מעל SMA200", "כן" if r.get("above200") else ("לא" if r.get("above200") is False else "—"), ""),
+                ("RS מול SPY", f"{r['rs']:+.1f}%" if r.get("rs") is not None else "—", ""),
+                ("דוח בעוד", f"{r['earn_days']} ימים" if r.get("earn_days") is not None else "לא נבדק", ""),
             ]), unsafe_allow_html=True)
         else:
             st.markdown(stat_grid([
@@ -1381,6 +1476,9 @@ if st.session_state.get("open"):
                 ("RVOL", f"{r['rvol']:.2f}", ""), ("R:R ל-TP1", f"1:{r['rr']:.1f}", "gd"),
                 ("R:R ל-TP3", f"1:{r['rr3']:.1f}", ""),
                 ("בולינג׳ר", ", ".join(r.get("bb", [])) or "—", ""),
+                ("מעל SMA200", "כן" if r.get("above200") else ("לא" if r.get("above200") is False else "—"), ""),
+                ("RS מול SPY", f"{r['rs']:+.1f}%" if r.get("rs") is not None else "—", ""),
+                ("דוח בעוד", f"{r['earn_days']} ימים" if r.get("earn_days") is not None else "לא נבדק", ""),
             ]), unsafe_allow_html=True)
     st.stop()
 
@@ -1390,6 +1488,15 @@ if go_:
     t0 = time.time()
     uni, uni_log = build_universe(limit)
     st.caption("יקום: " + " · ".join(uni_log) + f"  →  **{len(uni):,}** מניות ייחודיות")
+
+    spy_ret21 = None
+    spy_data = fetch(("SPY",)).get("SPY")
+    if spy_data is not None and len(spy_data) > 21:
+        sc = spy_data["Close"].values.astype(float)
+        spy_ret21 = float((sc[-1] / sc[-22] - 1) * 100)
+    C["spy_ret21"] = spy_ret21
+    CB["spy_ret21"] = spy_ret21
+
     prog, note = st.progress(0.0), st.empty()
     rows, drop, liq, last_bar = [], {}, 0, None
     batches = [tuple(uni[i:i + 120]) for i in range(0, len(uni), 120)]
@@ -1439,6 +1546,20 @@ if go_:
         prog.progress((i + 1) / len(batches))
     prog.empty()
     note.empty()
+    if earn_days > 0 and rows:
+        note2 = st.empty()
+        kept = []
+        for k, r in enumerate(rows):
+            note2.caption(f"בודק דוחות רבעוניים: {k+1}/{len(rows)}")
+            d2e = days_to_earnings(r["ticker"])
+            r["earn_days"] = d2e
+            if d2e is not None and 0 <= d2e <= earn_days:
+                drop[f"דוח בעוד {earn_days} ימים או פחות"] = \
+                    drop.get(f"דוח בעוד {earn_days} ימים או פחות", 0) + 1
+                continue
+            kept.append(r)
+        rows = kept
+        note2.empty()
     for r in rows:
         v_ = rank_verdict(r)
         r["tier"], r["tier_color"] = v_["tier"], v_["color"]

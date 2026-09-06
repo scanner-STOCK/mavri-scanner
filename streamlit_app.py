@@ -65,6 +65,12 @@ hr{border-color:var(--ln);}
         font-variant-numeric:tabular-nums;}
 .tc-d span{display:block;font-size:.62rem;color:var(--dm);direction:rtl;}
 .spark svg{width:100%;height:30px;display:block;opacity:.8;}
+.rankball{width:26px;height:26px;border-radius:50%;background:var(--rz);border:1px solid var(--ln);
+          display:flex;align-items:center;justify-content:center;flex:none;
+          font-family:'Frank Ruhl Libre',serif;font-size:.85rem;font-weight:700;color:var(--tx);
+          position:relative;}
+.rankball span{position:absolute;bottom:-14px;font-size:.55rem;color:var(--dm);font-weight:400;
+               white-space:nowrap;}
 .tierchip{font-size:.68rem;padding:.08rem .4rem;border-radius:3px;font-weight:500;letter-spacing:.02em;}
 .verdict-line{font-size:.72rem;font-weight:500;margin:.15rem 0 .1rem;}
 .badges{display:flex;gap:.28rem;flex-wrap:wrap;margin:.35rem 0 0;}
@@ -633,6 +639,73 @@ def rank_verdict(r):
                        f"אוטומטית טוב יותר; זה בדיוק הטעות שגילינו והפכה אותנו לזהירים.")
 
 
+def explain_ai(r, rank=None, total=None):
+    """A full written explanation combining every factor we actually computed —
+    no invented score, just the numbers put into plain sentences."""
+    parts = []
+    if rank is not None and total is not None:
+        parts.append(f"דירוג #{rank} מתוך {total} מניות שנמצאו בסריקה הזאת.")
+
+    reclaim_txt = ltr(f"{r.get('reclaim_pct', 0):+.1f}%")
+    to_entry_txt = ltr(f"{r['to_entry']:+.1f}%")
+
+    if r.get("kind") == "breakdown":
+        parts.append(
+            f"{r['ticker']} שברה תמיכה שנקבעה על פני כחודש בשיעור של {r['brk_pct']:.1f}%, "
+            f"בנפח שהגיע לפי {r['spike']:.1f} מהרגיל, ואז תפסה אותה מחדש — כרגע נסחרת "
+            f"{reclaim_txt} מעליה. זו תבנית 'שייקאאוט' קלאסית: מי שקנה מוקדם מדי נבהל "
+            f"ומכר בשבירה, ועכשיו המחיר מתאושש. חשוב לדעת: בניגוד לתבנית הזינוק-ותיקון, "
+            f"את התבנית הזאת עדיין לא בדקנו היסטורית — היא הגיונית מבחינה טכנית, אבל "
+            f"אין לנו אישוש סטטיסטי שהיא רווחית.")
+    else:
+        tier_txt = {
+            "A": ("המצב הכי אמין שיש למערכת: יובש הנפח בדיוק בטווח שהוכח רווחי "
+                  "(1.30–1.60) על יותר מ-100 עסקאות היסטוריות בשתי ריצות נפרדות."),
+            "B": ("מצב בינוני: יובש הנפח קרוב לטווח המוכח אך לא בתוכו. אין נתון "
+                  "היסטורי חד-משמעי על הטווח המדויק הזה."),
+            "C": ("מצב לא מבוסס: יובש הנפח רחוק מהטווח שנבדק. איפה שכן נבדק "
+                  "(מעל 1.6 או מתחת ל-1.1), התוצאה ההיסטורית הייתה שלילית."),
+        }.get(r.get("tier"), "")
+        parts.append(
+            f"{r['ticker']} עלתה {r['rise']:.0f}% תוך {r['leg_bars']} ימי מסחר בנפח "
+            f"שהגיע לשיא של פי {r['spike']:.1f} מהרגיל, ואז תיקנה {r['retrace']:.0f}% "
+            f"מהעלייה על נפח קטן פי {r['dry']:.2f}. {tier_txt}")
+
+    liq = []
+    if r["atr_pct"] >= 3:
+        liq.append(f"תנודתיות גבוהה יחסית (ATR {r['atr_pct']:.1f}%) — מתאימה לקצב מסחר יומי")
+    elif r["atr_pct"] < 2:
+        liq.append(f"תנודתיות נמוכה יחסית (ATR {r['atr_pct']:.1f}%) — התנועה עשויה להיות איטית")
+    if r["rvol"] < 0.85:
+        liq.append(f"נפח הימים האחרונים עדיין נמוך מהרגיל (RVOL {r['rvol']:.2f}) — "
+                   f"ההוראה עוד לא הופעלה, אין עדיין אישור קונים")
+    elif r["rvol"] >= 1.3:
+        liq.append(f"נפח הימים האחרונים כבר גבוה מהרגיל (RVOL {r['rvol']:.2f}) — "
+                   f"ייתכן שהתנועה כבר החלה")
+    if r.get("bb"):
+        liq.append(f"נגעה ברצועת בולינג׳ר {' ו'.join(r['bb'])}, אישור טכני נוסף")
+    if liq:
+        parts.append(" · ".join(liq) + ".")
+
+    waiting = r["to_entry"] > 0.3
+    wait_txt = "עדיין ממתינים לפריצה" if waiting else "קרוב מאוד להפעלה כרגע"
+    parts.append(
+        f"יחס סיכון-סיכוי ליעד הראשון: 1:{r['rr']:.1f}. נקודת הכניסה נמצאת "
+        f"{to_entry_txt} מהמחיר הנוכחי — {wait_txt}.")
+
+    if r.get("kind") == "breakdown":
+        bottom = "שורה תחתונה: תבנית טכנית הגיונית אך ניסיונית — הזדמנות משנית, לא ראשית."
+    elif r.get("tier") == "A":
+        bottom = "שורה תחתונה: אחת ההזדמנויות המבוססות ביותר שהמערכת מצאה בסריקה הזאת."
+    elif r.get("tier") == "B":
+        bottom = ("שורה תחתונה: הזדמנות סבירה — שקול גודל פוזיציה קטן יותר "
+                 "בהעדר אישוש היסטורי מלא לטווח הזה.")
+    else:
+        bottom = "שורה תחתונה: המערכת ממליצה בזהירות רבה — הנתונים רחוקים מכל מה שנבדק בעבר."
+    parts.append(bottom)
+    return " ".join(parts)
+
+
 def sparkline(vals):
     if not vals or len(vals) < 3:
         return ""
@@ -663,10 +736,14 @@ def ladder(r):
     return f'<div class="lad">{html}</div>'
 
 
-def card(r, best=False, watched=False, triggered=False, aging=False):
+def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, total=None):
     tier = r.get("tier") or rank_verdict(r)["tier"]
     tcolor = r.get("tier_color") or rank_verdict(r)["color"]
     vheadline = r.get("verdict_headline") or rank_verdict(r)["headline"]
+    rank_html = ""
+    if rank is not None:
+        rank_html = (f'<div class="rankball">{rank}'
+                    f'<span>{f"/{total}" if total else ""}</span></div>')
     ch = "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
     ch += f'<span class="chip">ATR {r["atr"]:.2f}$ · RVOL {r["rvol"]:.2f}</span>'
     near = r["to_entry"] <= 1.0
@@ -695,7 +772,7 @@ def card(r, best=False, watched=False, triggered=False, aging=False):
     badge_row = f'<div class="badges">{badges}</div>' if badges else ""
     return f"""<div class="tc{' top' if best else ''}{' near' if near and not triggered else ''}">
 <div class="tc-h"><div style="display:flex;align-items:baseline;gap:.5rem">
-<div class="tc-s">{r['ticker']}</div>
+{rank_html}<div class="tc-s">{r['ticker']}</div>
 <span class="tierchip" style="background:{tcolor}22;color:{tcolor};border:1px solid {tcolor}55">רמה {tier}</span>
 </div><div class="tc-d"><b>{head_val}</b><span>{head_lab}</span></div></div>
 <div class="verdict-line" style="color:{tcolor}">{vheadline}</div>
@@ -1071,6 +1148,9 @@ if st.session_state.get("open"):
         st.rerun()
 
     v_ = rank_verdict(r)
+    rank_disp = r.get("_rank")
+    total_disp = len(st.session_state.get("rows", []))
+    rank_tag = f'דירוג #{rank_disp} מתוך {total_disp} · ' if rank_disp else ""
     st.markdown(f"""<div style="direction:rtl;display:flex;align-items:center;gap:.9rem;
     margin:.8rem 0 1rem;padding:.85rem 1rem;background:var(--pan);border:1px solid var(--ln);
     border-right:4px solid {v_['color']};border-radius:5px">
@@ -1078,11 +1158,12 @@ if st.session_state.get("open"):
     color:{v_['color']}">{r['ticker']}</div>
     <div style="width:1px;align-self:stretch;background:var(--ln)"></div>
     <div style="flex:1">
-      <div style="font-size:.95rem;color:{v_['color']};font-weight:500">רמה {v_['tier']} — {v_['headline']}</div>
+      <div style="font-size:.95rem;color:{v_['color']};font-weight:500">{rank_tag}רמה {v_['tier']} — {v_['headline']}</div>
       <div style="font-size:.8rem;color:var(--dm);margin-top:.15rem">{r['why']}</div>
     </div></div>""", unsafe_allow_html=True)
-    with st.expander("למה זה הדירוג — הסבר מפורט"):
-        st.markdown(f'<div class="tw" style="font-size:.85rem;line-height:1.8">{v_["detail"]}</div>',
+    with st.expander("הסבר AI מלא על ההמלצה", expanded=True):
+        full_txt = explain_ai(r, rank=rank_disp, total=total_disp)
+        st.markdown(f'<div class="tw" style="font-size:.86rem;line-height:1.9">{full_txt}</div>',
                    unsafe_allow_html=True)
 
     INTERVALS = {
@@ -1437,8 +1518,12 @@ else:
         if not rows:
             st.info("אין מניות בטווח של 1% מרמת ההפעלה כרגע.")
             st.stop()
+        for idx, rr in enumerate(rows):
+            rr["_rank"] = idx + 1
+        total_n = len(rows)
         if view == "טבלה":
             t = pd.DataFrame([{
+                "#": r["_rank"],
                 "מניה": r["ticker"],
                 "סוג": "שבירה" if r.get("kind") == "breakdown" else "תיקון",
                 "יובש/שבירה": r["dry"], "מחיר": r["price"],
@@ -1485,7 +1570,8 @@ else:
                         aging = (age_ceiling - r["age"]) <= 3
                         st.markdown(card(r, best=(r is rows[0]),
                                          watched=(r["ticker"] in wl_tickers),
-                                         triggered=triggered, aging=aging),
+                                         triggered=triggered, aging=aging,
+                                         rank=r["_rank"], total=total_n),
                                     unsafe_allow_html=True)
                         bo, bw = st.columns([3, 1])
                         if bo.button("פתח ניתוח", key=f"o{r['ticker']}",

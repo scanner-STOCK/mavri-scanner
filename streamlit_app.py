@@ -1260,11 +1260,13 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         spy_hist = fetch(("SPY",), period=bt_period).get("SPY")
         spy_series = spy_return_lookup(spy_hist) if spy_hist is not None else None
         prog_b, note_b, live_b = st.progress(0.0), st.empty(), st.empty()
-        trades = []
+        trades, got_data, errored = [], 0, 0
         chunks = [tuple(uni_bt[i:i + 60]) for i in range(0, len(uni_bt), 60)]
         for ci, ch in enumerate(chunks):
             note_b.caption(f"מנה {ci+1}/{len(chunks)} · {len(trades)} עסקאות עד כה")
-            for t, dd in fetch(ch, period=bt_period).items():
+            batch = fetch(ch, period=bt_period)
+            got_data += len(batch)
+            for t, dd in batch.items():
                 try:
                     if float(dd["Close"].iloc[-1]) < min_px:
                         continue
@@ -1274,7 +1276,7 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
                         tr["ticker"] = t
                         trades.append(tr)
                 except Exception:
-                    pass
+                    errored += 1
             prog_b.progress((ci + 1) / len(chunks))
             if trades:
                 bb = pd.DataFrame(trades)
@@ -1282,6 +1284,23 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
                               f"{(bb['R']>0).mean()*100:.1f}% הצלחה · {bb['R'].mean():+.2f}R")
         prog_b.empty(); note_b.empty(); live_b.empty()
         st.session_state["bt"] = trades
+        st.session_state["bt_diag"] = dict(
+            requested=len(uni_bt), got_data=got_data, errored=errored,
+            spy_ok=spy_hist is not None, when=datetime.now(il).strftime("%H:%M:%S"))
+
+    if "bt_diag" in st.session_state:
+        dg = st.session_state["bt_diag"]
+        st.caption(f"ריצה אחרונה ({dg['when']}): ביקשנו {dg['requested']} מניות · "
+                  f"קיבלנו נתונים ל-{dg['got_data']} · SPY {'הצליח' if dg['spy_ok'] else 'נכשל'} "
+                  f"· {dg['errored']} שגיאות בעיבוד.")
+        if not st.session_state.get("bt"):
+            if dg["got_data"] == 0:
+                st.error("לא התקבלו נתונים בכלל — כנראה תקלת רשת זמנית מול Yahoo Finance. "
+                        "נסה שוב בעוד רגע.")
+            else:
+                st.warning("התקבלו נתונים אבל אף עסקה לא נמצאה. עם 100 מניות ותקופה של "
+                          "שנתיים זה קורה כשהסינון מחמיר מדי — נסה: יותר מניות, תקופה "
+                          "של 5y, או הרפה זמנית את יובש הנפח / ימים מהשיא למעלה.")
 
     if "bt" in st.session_state and st.session_state["bt"]:
         b = pd.DataFrame(st.session_state["bt"])

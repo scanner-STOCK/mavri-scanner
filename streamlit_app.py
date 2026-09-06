@@ -649,6 +649,76 @@ def why_he(r):
             f"ונתמכת ב-{r['support']:.2f}")
 
 
+def spy_return_lookup(spy_df):
+    """21-day rolling return of SPY, indexed by date, for point-in-time lookup
+    during the walk-forward backtest (as-of, tolerant of small calendar gaps)."""
+    sc = spy_df["Close"].astype(float)
+    ret = (sc / sc.shift(21) - 1) * 100
+    return ret.dropna()
+
+
+def backtest_walk(d, C, CB, ptype, spy_ret_series, hold=25, cooldown=10):
+    """Walk a single ticker's full history bar by bar, calling the SAME core()/
+    core_breakdown() the live scanner uses — so a backtest 'pass' means exactly
+    what a live match means, nothing reimplemented separately."""
+    A = prep(d)
+    n = len(A["c"])
+    dates = d.index
+    out = []
+    last = -999
+    for i in range(90, n - hold - 1):
+        if i - last < cooldown:
+            continue
+        spy_r21 = None
+        if spy_ret_series is not None:
+            try:
+                spy_r21 = float(spy_ret_series.asof(dates[i]))
+                if not np.isfinite(spy_r21):
+                    spy_r21 = None
+            except Exception:
+                spy_r21 = None
+        Ci = dict(C, spy_ret21=spy_r21)
+        found = None
+        if ptype in ("זינוק ותיקון לתמיכה", "שתי התבניות"):
+            r, _ = core(A, i, Ci)
+            if r is not None:
+                found = r
+        if found is None and ptype in ("שבירת תמיכה ותפיסה מחדש", "שתי התבניות"):
+            CBi = dict(CB, spy_ret21=spy_r21)
+            rb, _ = core_breakdown(A, i, CBi)
+            if rb is not None:
+                found = rb
+        if found is None:
+            continue
+        entry, stop, tp1, tp2 = found["entry"], found["stop"], found["tp1"], found["tp2"]
+        risk = entry - stop
+        h, l, c = A["h"], A["l"], A["c"]
+        filled, res = False, None
+        for j in range(i + 1, min(i + 1 + hold, n)):
+            if not filled:
+                if h[j] >= entry:
+                    filled = True
+                else:
+                    continue
+            if l[j] <= stop:
+                res = -1.0
+                break
+            if h[j] >= tp2:
+                res = (tp2 - entry) / risk
+                break
+            if h[j] >= tp1:
+                res = (tp1 - entry) / risk
+                break
+        last = i
+        if filled:
+            if res is None:
+                j = min(i + hold, n - 1)
+                res = (c[j] - entry) / risk
+            out.append(dict(R=res, dry=found.get("dry"), rs=found.get("rs"),
+                            above200=found.get("above200"), rr=found["rr"]))
+    return out
+
+
 def rank_verdict(r):
     """
     Ranking grounded in the walk-forward backtest, not an invented composite score.
@@ -1174,6 +1244,101 @@ CB = dict(win=win, sup_win=sup_win, break_win=break_win, break_min=break_min,
           break_max=break_max, reclaim_lo=reclaim_lo, reclaim_hi=reclaim_hi,
           atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min, need_trig=need_trig_b,
           trend_hard=trend_hard, rs_min=(rs_min_val if use_rs else None))
+
+with st.expander("בדיקה היסטורית — לפני שסומכים על סינון חדש"):
+    st.markdown("בודק כל איתות היסטורי שהמסננים שלמעלה היו מזהים, ועוקב קדימה: "
+               "האם ההוראה התמלאה, והאם המחיר הגיע ליעד לפני הסטופ. משתמש **באותן** "
+               "פונקציות שהסורק החי משתמש בהן — לא חישוב נפרד.")
+    bc1, bc2, bc3 = st.columns(3)
+    bt_n = bc1.slider("כמה מניות לבדוק", 20, 500, 100, 10,
+                      help="יותר מניות = בדיקה אמינה יותר, אבל איטית יותר.")
+    bt_period = bc2.selectbox("תקופה", ["2y", "5y"], index=0)
+    bt_hold = bc3.slider("ימי החזקה מקסימלי", 5, 60, 25, 5)
+
+    if st.button("הרץ בדיקה היסטורית", type="primary"):
+        uni_bt, _ = build_universe(bt_n)
+        spy_hist = fetch(("SPY",), period=bt_period).get("SPY")
+        spy_series = spy_return_lookup(spy_hist) if spy_hist is not None else None
+        prog_b, note_b, live_b = st.progress(0.0), st.empty(), st.empty()
+        trades = []
+        chunks = [tuple(uni_bt[i:i + 60]) for i in range(0, len(uni_bt), 60)]
+        for ci, ch in enumerate(chunks):
+            note_b.caption(f"מנה {ci+1}/{len(chunks)} · {len(trades)} עסקאות עד כה")
+            for t, dd in fetch(ch, period=bt_period).items():
+                try:
+                    if float(dd["Close"].iloc[-1]) < min_px:
+                        continue
+                    if float(dd["Close"].iloc[-1] * dd["Volume"].tail(20).mean()) < min_dv * 1e6:
+                        continue
+                    for tr in backtest_walk(dd, C, CB, ptype, spy_series, hold=bt_hold):
+                        tr["ticker"] = t
+                        trades.append(tr)
+                except Exception:
+                    pass
+            prog_b.progress((ci + 1) / len(chunks))
+            if trades:
+                bb = pd.DataFrame(trades)
+                live_b.caption(f"ביניים: {len(bb)} עסקאות · "
+                              f"{(bb['R']>0).mean()*100:.1f}% הצלחה · {bb['R'].mean():+.2f}R")
+        prog_b.empty(); note_b.empty(); live_b.empty()
+        st.session_state["bt"] = trades
+
+    if "bt" in st.session_state and st.session_state["bt"]:
+        b = pd.DataFrame(st.session_state["bt"])
+        wr = (b["R"] > 0).mean() * 100
+        avg = b["R"].mean()
+        gp = b.loc[b["R"] > 0, "R"].sum()
+        gl = -b.loc[b["R"] < 0, "R"].sum()
+        pf = gp / gl if gl > 0 else float("inf")
+        k = st.columns(5)
+        k[0].metric("עסקאות", len(b))
+        k[1].metric("אחוז הצלחה", f"{wr:.1f}%")
+        k[2].metric("תוחלת", f"{avg:+.2f}R")
+        k[3].metric("Profit factor", f"{pf:.2f}")
+        k[4].metric("סה\"כ", f"{b['R'].sum():+.0f}R")
+
+        if len(b) < 60:
+            st.warning(f"{len(b)} עסקאות בלבד — מדגם קטן מדי כדי לסמוך עליו. "
+                      "הגדל את מספר המניות או את התקופה.")
+
+        def bucket(col, bins, labels, title):
+            d2 = b.dropna(subset=[col]).copy()
+            if not len(d2):
+                st.caption(f"{title}: אין מספיק נתונים.")
+                return
+            d2["_b"] = pd.cut(d2[col], bins, labels=labels)
+            g = d2.groupby("_b", observed=True).agg(
+                עסקאות=("R", "size"),
+                אחוז_הצלחה=("R", lambda x: round((x > 0).mean() * 100, 1)),
+                תוחלת_R=("R", lambda x: round(x.mean(), 2))).reset_index()
+            g.columns = [title, "עסקאות", "אחוז הצלחה", "תוחלת R"]
+            st.dataframe(g, hide_index=True, use_container_width=True)
+
+        st.markdown("##### יובש נפח — בדיקת אימות חוזרת")
+        bucket("dry", [0, 1.1, 1.3, 1.6, 2.2, 99],
+              ["<1.1", "1.1-1.3", "1.3-1.6", "1.6-2.2", "2.2+"], "יובש נפח")
+
+        st.markdown("##### חוזק מול השוק (RS) — גורם חדש, לא נבדק לפני כן")
+        bucket("rs", [-100, 0, 100], ["שלילי (חלשה מהשוק)", "חיובי (חזקה מהשוק)"], "RS")
+
+        st.markdown("##### מגמת יסוד (SMA200) — גורם חדש, לא נבדק לפני כן")
+        b["trend_txt"] = b["above200"].map({True: "מעל SMA200", False: "מתחת ל-SMA200"})
+        d3 = b.dropna(subset=["trend_txt"])
+        if len(d3):
+            g3 = d3.groupby("trend_txt").agg(
+                עסקאות=("R", "size"),
+                אחוז_הצלחה=("R", lambda x: round((x > 0).mean() * 100, 1)),
+                תוחלת_R=("R", lambda x: round(x.mean(), 2))).reset_index()
+            g3.columns = ["מגמה", "עסקאות", "אחוז הצלחה", "תוחלת R"]
+            st.dataframe(g3, hide_index=True, use_container_width=True)
+        else:
+            st.caption("אין מספיק נתונים.")
+
+        st.caption("אם קטגוריה מסוימת מראה תוחלת גבוהה יותר באופן עקבי — שווה להפוך "
+                  "אותה לסינון קבוע. אם ההבדלים קטנים או לא עקביים, זה כנראה רעש. "
+                  "דוחות רבעוניים לא ניתנים לבדיקה כאן — אין לנו נתוני דוחות עבר אמינים בחינם.")
+        st.download_button("הורד את כל העסקאות (CSV)", b.to_csv(index=False),
+                          f"backtest_{datetime.now():%Y%m%d_%H%M}.csv", "text/csv")
 
 # ---------------------------------------------------------------- detail
 

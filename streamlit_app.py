@@ -307,7 +307,7 @@ def build_universe(limit):
     return out[:limit], log
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=30, show_spinner=False)
 def fetch(tickers, period="1y"):
     out = {}
     try:
@@ -327,7 +327,7 @@ def fetch(tickers, period="1y"):
     return out
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, max_entries=40, show_spinner=False)
 def fetch_one(t, period, interval):
     """Single ticker, any interval. Tries two different Yahoo endpoints with
     backoff before giving up — the two methods sometimes succeed independently
@@ -335,7 +335,7 @@ def fetch_one(t, period, interval):
     for attempt in range(3):
         try:
             d = yf.download(t, period=period, interval=interval, auto_adjust=False,
-                            progress=False, timeout=45, threads=False)
+                            progress=False, timeout=20, threads=False)
             if d is not None and len(d):
                 if isinstance(d.columns, pd.MultiIndex):
                     d.columns = d.columns.get_level_values(0)
@@ -358,15 +358,9 @@ def fetch_one(t, period, interval):
 
 
 def get_chart_data(r, period_key, interval, ranges):
-    """Prefer the daily data already downloaded during the scan — it's proven
-    to work for this exact ticker. Only reach for a fresh single-ticker fetch
-    when the interval isn't daily or the cached history is too short."""
-    if interval == "1d":
-        cached = r.get("_daily")
-        days_needed = {"3 חודשים": 70, "6 חודשים": 135, "שנה": 260, "שנתיים": 999}
-        need = days_needed.get(period_key, 999)
-        if cached is not None and len(cached) >= min(need, 250):
-            return cached.tail(need) if len(cached) < need else cached.tail(need)
+    """Fetch chart data for one ticker. fetch_one is cached and retries across
+    two Yahoo endpoints, so this is the reliable path; we no longer keep price
+    DataFrames in session_state because that grew memory without bound."""
     return fetch_one(r["ticker"], ranges[period_key], interval)
 
 
@@ -494,7 +488,7 @@ def core(A, i, C):
                 bb=tags, spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=200, show_spinner=False)
 def days_to_earnings(ticker):
     """Trading-unaware calendar days until the next known earnings date, or None
     if unavailable. Only ever called on the small matched subset — never on the
@@ -939,7 +933,7 @@ def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, 
 <div class="tw">{r['why']}</div></div>"""
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=10, show_spinner=False)
 def live(tickers):
     """Fresh-ish quotes for the watchlist. 60-second cache."""
     out = {}
@@ -947,7 +941,7 @@ def live(tickers):
         return out
     try:
         raw = yf.download(list(tickers), period="1mo", interval="1d", group_by="ticker",
-                          auto_adjust=False, threads=True, progress=False, timeout=30)
+                          auto_adjust=False, threads=True, progress=False, timeout=12)
     except Exception:
         return out
     if raw is None or len(raw) == 0:
@@ -1212,7 +1206,7 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P["sh"]), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 200, 10000, 4000, 100,
+    limit = j4.slider("מספר מניות לסריקה", 200, 6000, 1500, 100,
                       help="מעל 4000 לוקח משמעותית יותר זמן להוריד. "
                            "המספר האמיתי הזמין מוצג אחרי הסריקה.")
 
@@ -1407,7 +1401,11 @@ def render_watchlist():
     st.markdown("---")
 
 
-render_watchlist()
+try:
+    render_watchlist()
+except Exception:
+    st.warning("לא הצלחתי לטעון את רשימת המעקב כרגע (כנראה תקלת רשת זמנית). "
+               "שאר המערכת עובדת כרגיל.")
 
 if st.session_state.get("open"):
     r = next((x for x in st.session_state.get("rows", [])
@@ -1722,8 +1720,7 @@ if go_:
                 for r in found_here:
                     sh = int((acct * riskp / 100) / r["risk_share"])
                     r.update(ticker=t, shares=sh,
-                             risk_total=round(sh * r["risk_share"], 2),
-                             _daily=d.tail(300).copy())
+                             risk_total=round(sh * r["risk_share"], 2))
                     rows.append(r)
             except Exception:
                 drop["שגיאה"] = drop.get("שגיאה", 0) + 1

@@ -225,8 +225,8 @@ SE MELI GRAB CPNG STNE PAGS VIST GGAL BMA PAM YPF TS TX
 """.split()
 
 PRESETS = {
-    "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", bbmode="בונוס", price=10.0, dv=15.0,
-                       sh=0.3, atr=1.0, atrp=2.0, rise=12, age=(3, 20), retr=(20, 70),
+    "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", bbmode="בונוס", price=4.0, dv=8.0,
+                       sh=0.0, atr=0.5, atrp=2.0, rise=8, age=(3, 45), retr=(20, 70),
                        rr=1.5, off=12),
     "רחב": dict(dry=1.05, bb="אחת מהשתיים", bbmode="בונוס", price=5.0, dv=8.0, sh=0.2,
                 atr=0.4, atrp=1.5, rise=6, age=(2, 35), retr=(12, 88), rr=1.0, off=20),
@@ -309,7 +309,7 @@ def build_universe(limit):
     return out[:limit], log
 
 
-@st.cache_data(ttl=1800, max_entries=30, show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=45, show_spinner=False)
 def fetch(tickers, period="1y"):
     out = {}
     try:
@@ -991,7 +991,7 @@ def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, 
 <div class="tw">{r['why']}</div></div>"""
 
 
-@st.cache_data(ttl=60, max_entries=10, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=10, show_spinner=False)
 def live(tickers):
     """Fresh-ish quotes for the watchlist. 60-second cache."""
     out = {}
@@ -1274,7 +1274,7 @@ with st.expander("סינון מתקדם"):
                           index=["בונוס", "חובה"].index(P.get("bbmode", "בונוס")),
                           help="בונוס = מסומן בתווית אך לא פוסל. חובה = מסנן.")
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
-    min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P["sh"]), 0.1,
+    min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P.get("sh", 0.0)), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
     limit = j4.slider("מספר מניות לסריקה", 200, 7000, 4000, 100,
                       help="מעל 4000 לוקח משמעותית יותר זמן להוריד. "
@@ -1288,9 +1288,9 @@ with st.expander("סינון מתקדם"):
     use_rs = p2.checkbox("דרוש חוזק מול השוק", value=False,
                          help="RS מול SPY חיובי — המנייה עלתה יותר מהמדד בחודש האחרון.")
     rs_min_val = p3.number_input("RS מינימלי %", -20.0, 20.0, 0.0, 1.0, disabled=not use_rs)
-    earn_days = p4.number_input("הרחק מדוח (ימים)", 0, 30, 5, 1,
-                                help="0 מכבה. בודק רק את המניות שכבר עברו את שאר "
-                                     "הסינון — לא כל היקום, כדי לא להאט את הסריקה.")
+    earn_days = p4.number_input("הרחק מדוח (ימים)", 0, 30, 0, 1,
+                                help="0 = כבוי (מהיר). כל ערך אחר מוסיף קריאת רשת "
+                                     "לכל מנייה שנמצאה, ומאט את סוף הסריקה בכמה שניות.")
 
     q1, q2, q3 = st.columns(3)
     rev_hard = q1.checkbox("דרוש נר היפוך איכותי", value=True,
@@ -1761,7 +1761,7 @@ if go_:
 
     prog, note = st.progress(0.0), st.empty()
     rows, drop, liq, last_bar = [], {}, 0, None
-    batches = [tuple(uni[i:i + 120]) for i in range(0, len(uni), 120)]
+    batches = [tuple(uni[i:i + 200]) for i in range(0, len(uni), 200)]
     for i, b in enumerate(batches):
         note.caption(f"{i+1} / {len(batches)}  ·  {len(rows)} התאמות")
         for t, d in fetch(b).items():

@@ -1,2032 +1,1990 @@
 """
-MAVRI Pro
-Daily momentum and pre-breakout stock screener.
-
-Important:
-- Daily data identifies setups, not real-time intraday execution.
-- yfinance is suitable for research/prototyping, not guaranteed live execution.
-- Backtests are estimates and do not guarantee future performance.
+MAVRI — impulse / pullback screener.
+Leg up on volume -> pullback on drying volume -> reversal at support.
 """
 
-from __future__ import annotations
-
 import io
-import math
-import time
-from collections import Counter
-from dataclasses import dataclass, replace
-from datetime import datetime
-from html import escape
-from typing import Any, Iterable
-from zoneinfo import ZoneInfo
-
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import time
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
-
-# ============================================================
-# APP CONFIG
-# ============================================================
-
-st.set_page_config(
-    page_title="MAVRI Pro",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
-UA = {"User-Agent": "Mozilla/5.0 MAVRI-Pro/2.0"}
-BATCH_SIZE = 75
-MAX_RESULTS = 100
-DEFAULT_SCAN_SIZE = 4000
+st.set_page_config(page_title="MAVRI", layout="wide",
+                   initial_sidebar_state="collapsed", page_icon="◈")
 
 CSS = """
 <style>
-@import url('[fonts.googleapis.com](https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;600;700&display=swap)');
+@import url('https://fonts.googleapis.com/css2?family=Frank+Ruhl+Libre:wght@400;500;700&family=Heebo:wght@200;300;400;500;700&display=swap');
+:root{--bg:#0B1216;--pan:#111C22;--rz:#17242B;--ln:#22333C;
+      --tx:#E9EFF1;--mu:#93A8B2;--dm:#5F7581;--gd:#D4A64B;--lg:#2FBF8F;--sh:#E0605F;}
+html,body,[class*="css"]{font-family:'Heebo',sans-serif;}
+.stApp{background:var(--bg);}
+#MainMenu,footer,header{visibility:hidden;}
+.block-container{padding-top:.7rem;padding-bottom:4rem;max-width:1320px;}
+hr{border-color:var(--ln);}
 
-:root {
-    --bg:#090D15;
-    --panel:#121826;
-    --panel2:#1A2232;
-    --line:#293348;
-    --text:#F8FAFC;
-    --muted:#94A3B8;
-    --dim:#64748B;
-    --gold:#F59E0B;
-    --green:#10B981;
-    --red:#EF4444;
-    --blue:#3B82F6;
-}
+/* ---- top bar ---- */
+.bar{display:flex;align-items:center;justify-content:space-between;gap:1rem;
+     border-bottom:1px solid var(--ln);padding:.1rem 0 .55rem;flex-wrap:wrap;}
+.brand{display:flex;align-items:baseline;gap:.7rem;}
+.brand h1{font-family:'Frank Ruhl Libre',serif;font-size:1.5rem;font-weight:700;margin:0;
+          color:var(--tx);letter-spacing:.14em;}
+.brand em{font-style:normal;font-size:.72rem;color:var(--dm);letter-spacing:.02em;}
+.status{display:flex;gap:1.4rem;align-items:center;direction:rtl;}
+.status i{font-style:normal;font-size:.7rem;color:var(--dm);display:block;letter-spacing:.02em;}
+.status b{font-family:'Frank Ruhl Libre',serif;font-size:.98rem;font-weight:500;color:var(--mu);
+          font-variant-numeric:tabular-nums;}
+.led{width:7px;height:7px;border-radius:50%;display:inline-block;margin-left:.35rem;}
+.led.on{background:var(--lg);box-shadow:0 0 7px rgba(47,191,143,.8);}
+.led.off{background:var(--dm);}
+.led.pre{background:var(--gd);box-shadow:0 0 7px rgba(212,166,75,.7);}
 
-html, body, [class*="css"] {
-    font-family:'Heebo', sans-serif;
-}
+/* ---- counters ---- */
+.kpi{display:flex;gap:0;flex-wrap:wrap;border:1px solid var(--ln);border-radius:4px;
+     overflow:hidden;margin:.9rem 0 1rem;}
+.kpi div{flex:1;min-width:110px;padding:.6rem .85rem;border-left:1px solid var(--ln);direction:rtl;}
+.kpi div:last-child{border-left:0;}
+.kpi b{font-family:'Frank Ruhl Libre',serif;font-size:1.35rem;font-weight:500;display:block;
+       line-height:1.15;color:var(--tx);font-variant-numeric:tabular-nums;}
+.kpi span{font-size:.68rem;color:var(--dm);letter-spacing:.02em;}
+.kpi div.hi b{color:var(--gd);}
 
-.stApp {
-    background:
-        radial-gradient(circle at 90% 0%, rgba(59,130,246,.10), transparent 28%),
-        radial-gradient(circle at 5% 20%, rgba(16,185,129,.07), transparent 24%),
-        var(--bg);
-    color:var(--text);
-}
+/* ---- card ---- */
+.tc{background:var(--pan);border:1px solid var(--ln);border-radius:5px;
+    padding:.85rem .95rem .75rem;direction:rtl;height:100%;}
+.tc.top{border-color:rgba(212,166,75,.4);}
+.tc-h{display:flex;align-items:baseline;justify-content:space-between;padding-bottom:.35rem;}
+.tc-s{font-family:'Frank Ruhl Libre',serif;font-size:1.4rem;font-weight:700;color:var(--tx);
+      direction:ltr;letter-spacing:.04em;}
+.tc-d{text-align:left;direction:ltr;}
+.tc-d b{font-family:'Frank Ruhl Libre',serif;font-size:1.25rem;font-weight:500;color:var(--gd);
+        font-variant-numeric:tabular-nums;}
+.tc-d span{display:block;font-size:.62rem;color:var(--dm);direction:rtl;}
+.spark svg{width:100%;height:30px;display:block;opacity:.8;}
+.rankball{width:26px;height:26px;border-radius:50%;background:var(--rz);border:1px solid var(--ln);
+          display:flex;align-items:center;justify-content:center;flex:none;
+          font-family:'Frank Ruhl Libre',serif;font-size:.85rem;font-weight:700;color:var(--tx);
+          position:relative;}
+.rankball span{position:absolute;bottom:-14px;font-size:.55rem;color:var(--dm);font-weight:400;
+               white-space:nowrap;}
+.tierchip{font-size:.68rem;padding:.08rem .4rem;border-radius:3px;font-weight:500;letter-spacing:.02em;}
+.verdict-line{font-size:.72rem;font-weight:500;margin:.15rem 0 .1rem;}
+.badges{display:flex;gap:.28rem;flex-wrap:wrap;margin:.35rem 0 0;}
+.chips{display:flex;gap:.28rem;flex-wrap:wrap;margin:.28rem 0 .1rem;}
+.chip{font-size:.62rem;padding:.11rem .4rem;border:1px solid var(--ln);border-radius:2px;color:var(--mu);}
+.chip.g{border-color:rgba(212,166,75,.45);color:var(--gd);}
+.lad{position:relative;height:168px;margin:.4rem 0 .6rem;}
+.lad:before{content:'';position:absolute;right:70px;top:5px;bottom:5px;width:1px;
+            background:linear-gradient(180deg,rgba(47,191,143,.45),rgba(224,96,95,.45));}
+.lv{position:absolute;right:0;left:0;height:0;display:flex;align-items:center;gap:.45rem;}
+.lv .tg{width:66px;text-align:left;font-size:.66rem;color:var(--dm);}
+.lv .dt{width:6px;height:6px;border-radius:50%;background:var(--dm);margin-right:-3px;flex:none;}
+.lv .px{font-family:'Frank Ruhl Libre',serif;font-size:.9rem;color:var(--mu);
+        font-variant-numeric:tabular-nums;direction:ltr;}
+.lv.tp .dt{background:var(--lg);} .lv.tp .px{color:var(--lg);}
+.lv.st .dt{background:var(--sh);} .lv.st .px,.lv.st .tg{color:var(--sh);}
+.lv.en .dt{width:10px;height:10px;background:var(--gd);margin-right:-5px;
+           box-shadow:0 0 0 3px rgba(212,166,75,.18);}
+.lv.en .px{font-size:1.14rem;font-weight:700;color:var(--tx);}
+.lv.en .tg{color:var(--gd);}
+.lv.now .dt{background:transparent;border:1px solid var(--dm);}
+.lv.now .px,.lv.now .tg{color:var(--dm);font-size:.75rem;}
+.tl{display:flex;justify-content:space-between;font-size:.71rem;color:var(--dm);
+    border-top:1px solid var(--ln);padding-top:.42rem;}
+.tl b{color:var(--mu);font-weight:500;font-variant-numeric:tabular-nums;}
+.tw{font-size:.72rem;line-height:1.6;color:var(--dm);margin-top:.4rem;}
 
-#MainMenu, footer, header {
-    visibility:hidden;
-}
+.empty{border:1px dashed var(--ln);border-radius:5px;padding:2.4rem 1.4rem;text-align:center;
+       color:var(--dm);direction:rtl;line-height:1.9;font-size:.87rem;}
+h3{font-family:'Frank Ruhl Libre',serif !important;font-weight:500 !important;
+   color:var(--tx) !important;direction:rtl;}
+label{color:var(--mu) !important;font-size:.75rem !important;}
+div[data-testid="stExpander"]{border:1px solid var(--ln);border-radius:4px;background:var(--pan);}
+.fn{direction:rtl;margin:.2rem 0 .4rem;}
+.fn .row{display:flex;align-items:center;gap:.6rem;margin:.22rem 0;}
+.fn .nm{width:150px;font-size:.72rem;color:var(--mu);text-align:right;}
+.fn .tr{flex:1;height:16px;background:var(--rz);border-radius:2px;overflow:hidden;}
+.fn .fl{height:100%;background:linear-gradient(90deg,#2C4A57,#3E6B7C);}
+.fn .fl.cut{background:linear-gradient(90deg,#5A2A2E,#8E4046);}
+.fn .fl.worst{background:linear-gradient(90deg,#7A2530,#C13D4A);}
+.fn .row .nm{transition:color .15s;}
+.blocker{direction:rtl;font-size:.76rem;color:var(--dm);margin:-.3rem 0 .9rem;}
+.blocker b{color:var(--sh);font-weight:500;}
+.tc{transition:box-shadow .18s,border-color .18s;}
+.tc:hover{box-shadow:0 4px 22px rgba(0,0,0,.35);border-color:rgba(212,166,75,.28);}
+.fn .vl{width:64px;font-size:.72rem;color:var(--dm);font-variant-numeric:tabular-nums;
+        text-align:left;direction:ltr;}
 
-.block-container {
-    padding-top:1rem;
-    padding-bottom:4rem;
-    max-width:1450px;
-}
+.dh{display:flex;align-items:flex-end;justify-content:space-between;gap:1rem;
+    border-bottom:1px solid var(--ln);padding-bottom:.7rem;margin-bottom:.9rem;flex-wrap:wrap;}
+.dh .sym{font-family:'Frank Ruhl Libre',serif;font-size:2.3rem;font-weight:700;
+         color:var(--tx);letter-spacing:.04em;line-height:1;}
+.dh .pr{font-family:'Frank Ruhl Libre',serif;font-size:1.5rem;color:var(--mu);
+        font-variant-numeric:tabular-nums;}
+.dh .ch{font-size:.9rem;font-variant-numeric:tabular-nums;}
+.dh .up{color:var(--lg);} .dh .dn{color:var(--sh);}
 
-div[data-testid="stExpander"] {
-    border:1px solid var(--line);
-    border-radius:12px;
-    background:rgba(18,24,38,.88);
-    overflow:hidden;
-}
+.sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:1px;
+    background:var(--ln);border:1px solid var(--ln);border-radius:4px;overflow:hidden;
+    direction:rtl;margin:.2rem 0 1rem;}
+.sg div{background:var(--pan);padding:.55rem .7rem;}
+.sg b{display:block;font-family:'Frank Ruhl Libre',serif;font-size:1.08rem;font-weight:500;
+      color:var(--tx);font-variant-numeric:tabular-nums;line-height:1.25;}
+.sg span{font-size:.65rem;color:var(--dm);}
+.sg div.gd b{color:var(--gd);} .sg div.up b{color:var(--lg);} .sg div.dn b{color:var(--sh);}
 
-div[data-testid="stExpander"] summary {
-    background:rgba(255,255,255,.02);
-}
+.rmap{position:relative;height:52px;margin:.5rem 0 1rem;direction:ltr;}
+.rmap .base{position:absolute;top:23px;left:0;right:0;height:5px;background:var(--rz);border-radius:3px;}
+.rmap .risk{position:absolute;top:23px;height:5px;background:rgba(224,96,95,.55);}
+.rmap .rew{position:absolute;top:23px;height:5px;background:rgba(47,191,143,.5);}
+.rmap .mk{position:absolute;top:12px;width:2px;height:27px;background:var(--dm);}
+.rmap .mk.e{background:var(--gd);height:33px;top:9px;}
+.rmap .lb{position:absolute;top:42px;font-size:.62rem;color:var(--dm);transform:translateX(-50%);
+          white-space:nowrap;}
+.rmap .lb.e{color:var(--gd);}
 
-label, h2, h3 {
-    color:var(--muted) !important;
-}
-
-.stButton button {
-    border-radius:9px;
-    font-weight:600;
-    transition:.18s ease;
-}
-
-.stButton button:hover {
-    transform:translateY(-1px);
-}
-
-.topbar {
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:1rem;
-    padding:1rem 1.4rem;
-    margin-bottom:1.2rem;
-    border:1px solid var(--line);
-    border-radius:14px;
-    background:rgba(18,24,38,.80);
-    backdrop-filter:blur(12px);
-}
-
-.brand {
-    display:flex;
-    align-items:baseline;
-    gap:.75rem;
-}
-
-.brand-name {
-    margin:0;
-    font-size:2rem;
-    font-weight:700;
-    letter-spacing:.10em;
-    background:linear-gradient(90deg,var(--blue),var(--green));
-    -webkit-background-clip:text;
-    -webkit-text-fill-color:transparent;
-}
-
-.brand-subtitle {
-    color:var(--muted);
-    font-size:.88rem;
-}
-
-.clock-label {
-    color:var(--dim);
-    font-size:.68rem;
-    text-align:right;
-}
-
-.clock-value {
-    color:var(--text);
-    font-size:1.1rem;
-    font-weight:600;
-    direction:ltr;
-}
-
-.kpis {
-    display:grid;
-    grid-template-columns:repeat(5,minmax(120px,1fr));
-    gap:.6rem;
-    margin:1rem 0 1.2rem;
-}
-
-.kpi {
-    direction:rtl;
-    border:1px solid var(--line);
-    border-radius:11px;
-    padding:1rem;
-    background:rgba(18,24,38,.90);
-}
-
-.kpi strong {
-    display:block;
-    color:var(--text);
-    font-size:1.45rem;
-    line-height:1.2;
-}
-
-.kpi span {
-    color:var(--dim);
-    font-size:.73rem;
-}
-
-.kpi.good strong {
-    color:var(--green);
-}
-
-.notice {
-    direction:rtl;
-    padding:.85rem 1rem;
-    margin:.5rem 0 1rem;
-    border-radius:9px;
-    border:1px solid rgba(245,158,11,.25);
-    background:rgba(245,158,11,.08);
-    color:var(--muted);
-    font-size:.84rem;
-}
-
-.notice strong {
-    color:var(--gold);
-}
-
-.card {
-    direction:rtl;
-    height:100%;
-    padding:1rem;
-    border:1px solid var(--line);
-    border-radius:13px;
-    background:rgba(18,24,38,.86);
-    box-shadow:0 7px 24px rgba(0,0,0,.16);
-    transition:.2s ease;
-}
-
-.card:hover {
-    transform:translateY(-3px);
-    border-color:rgba(59,130,246,.65);
-    box-shadow:0 13px 32px rgba(0,0,0,.28);
-}
-
-.card.top {
-    border-color:rgba(16,185,129,.55);
-}
-
-.card-head {
-    display:flex;
-    justify-content:space-between;
-    align-items:flex-start;
-    border-bottom:1px solid var(--line);
-    padding-bottom:.55rem;
-    margin-bottom:.65rem;
-}
-
-.ticker {
-    direction:ltr;
-    font-size:1.55rem;
-    font-weight:700;
-    letter-spacing:.05em;
-}
-
-.score {
-    direction:ltr;
-    color:var(--green);
-    font-size:1.2rem;
-    font-weight:700;
-    text-align:left;
-}
-
-.score-label {
-    color:var(--dim);
-    font-size:.65rem;
-    text-align:left;
-}
-
-.spark {
-    margin:.45rem 0 .6rem;
-}
-
-.spark svg {
-    width:100%;
-    height:42px;
-    display:block;
-}
-
-.chips {
-    display:flex;
-    flex-wrap:wrap;
-    gap:.35rem;
-    margin:.55rem 0;
-}
-
-.chip {
-    display:inline-block;
-    padding:.22rem .5rem;
-    border:1px solid var(--line);
-    border-radius:6px;
-    color:var(--muted);
-    background:var(--panel2);
-    font-size:.67rem;
-}
-
-.chip.green {
-    color:var(--green);
-    border-color:rgba(16,185,129,.35);
-    background:rgba(16,185,129,.08);
-}
-
-.chip.gold {
-    color:var(--gold);
-    border-color:rgba(245,158,11,.35);
-    background:rgba(245,158,11,.08);
-}
-
-.levels {
-    display:grid;
-    grid-template-columns:repeat(3,1fr);
-    gap:.4rem;
-    margin-top:.65rem;
-}
-
-.level {
-    padding:.48rem;
-    border-radius:7px;
-    background:rgba(255,255,255,.025);
-    border:1px solid var(--line);
-}
-
-.level span {
-    display:block;
-    color:var(--dim);
-    font-size:.63rem;
-}
-
-.level b {
-    direction:ltr;
-    display:block;
-    color:var(--text);
-    font-size:.82rem;
-}
-
-.explain {
-    color:var(--muted);
-    line-height:1.55;
-    font-size:.76rem;
-    margin-top:.65rem;
-    padding:.65rem;
-    background:var(--panel2);
-    border-radius:8px;
-}
-
-@media(max-width:900px) {
-    .kpis {
-        grid-template-columns:repeat(2,1fr);
-    }
-}
+.near{border-color:rgba(47,191,143,.5) !important;}
+.wl-row{display:flex;align-items:center;gap:.8rem;background:var(--pan);
+        border:1px solid var(--ln);border-radius:4px;padding:.6rem .9rem;
+        margin-bottom:.5rem;direction:rtl;}
+.wl-row.live{border-right:3px solid var(--gd);}
+.wl-row.good{border-right:3px solid var(--lg);}
+.wl-row.bad{border-right:3px solid var(--sh);opacity:.72;}
+.wl-row.wait{border-right:3px solid var(--dm);}
+.wl-sym{font-family:'Frank Ruhl Libre',serif;font-size:1.15rem;font-weight:700;
+        color:var(--tx);width:80px;direction:ltr;}
+.wl-st{width:110px;font-size:.78rem;}
+.wl-st.live{color:var(--gd);} .wl-st.good{color:var(--lg);}
+.wl-st.bad{color:var(--sh);} .wl-st.wait{color:var(--dm);}
+.wl-px{font-family:'Frank Ruhl Libre',serif;font-size:.95rem;color:var(--mu);
+       font-variant-numeric:tabular-nums;width:90px;direction:ltr;}
+.wl-r{width:80px;font-size:.85rem;font-variant-numeric:tabular-nums;direction:ltr;}
+.wl-r.p{color:var(--lg);} .wl-r.n{color:var(--sh);} .wl-r.z{color:var(--dm);}
+.wl-note{flex:1;font-size:.74rem;color:var(--dm);}
+.badge{display:inline-block;font-size:.6rem;padding:.1rem .4rem;border-radius:2px;
+       background:rgba(47,191,143,.16);color:var(--lg);margin-right:.3rem;}
+a.tv{font-size:.68rem;color:var(--dm);text-decoration:none;border-bottom:1px dotted var(--ln);}
+a.tv:hover{color:var(--gd);}
+@media(max-width:820px){
+  [data-testid="stHorizontalBlock"]{flex-direction:column !important;gap:.5rem !important;}
+  [data-testid="stHorizontalBlock"]>div{width:100% !important;flex:1 1 100% !important;}
+  .block-container{padding-left:.55rem;padding-right:.55rem;}
+  .status{gap:.85rem;} .kpi div{min-width:80px;padding:.5rem .55rem;}
+  .kpi b{font-size:1.12rem;} .dh .sym{font-size:1.7rem;}
+  .fn .nm{width:98px;font-size:.64rem;} .lad{height:158px;}
+  .rmap .lb{font-size:.55rem;}}
 </style>
 """
-
 st.markdown(CSS, unsafe_allow_html=True)
 
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"}
 
-# ============================================================
-# MODELS
-# ============================================================
+BACKUP = """AAPL MSFT NVDA GOOGL GOOG AMZN META TSLA AVGO AMD INTC QCOM MU LRCX KLAC AMAT ADI TXN
+ON MPWR SWKS QRVO MRVL NXPI ASML TSM ARM SMCI DELL HPQ HPE NTAP STX WDC ALAB CRDO
+CRM ORCL ADBE NOW SNOW DDOG NET CRWD ZS OKTA PANW FTNT S PLTR MDB TEAM WDAY ESTC GTLB
+CFLT PATH AI BBAI SOUN TTD APP U RBLX EA TTWO RDDT SNAP PINS BMBL MTCH DUOL
+SHOP SQ PYPL COIN HOOD SOFI AFRM UPST LC ALLY COF DFS SYF AXP V MA TOST NU
+JPM BAC WFC C GS MS SCHW BK STT TFC USB PNC RF KEY CFG HBAN FITB ZION CMA
+BX KKR APO ARES TPG OWL BLK STEP BDC WKC ACIW ABG LAD FTDR AWI BCC ETN ACHC SHW CSW TXRH
+UNH ELV CI CVS HUM CNC MOH LLY PFE MRK ABBV BMY AMGN GILD BIIB VRTX REGN ALNY
+MRNA BNTX NVAX ILMN TMO DHR SYK BSX MDT ABT ISRG EW ZBH BAX BDX HIMS OSCR MRVI
+CRSP NTLA BEAM EDIT VERV SANA RXRX IONS SRPT NBIX EXAS NTRA TEM TWST PACB HALO HAE VEEV
+XOM CVX COP EOG DVN FANG OXY HES MRO APA SLB HAL BKR NOV FTI RIG VAL
+VLO MPC PSX DINO PBF DK CVI KMI WMB OKE ET EPD MPLX TRGP LNG AR RRC SWN EQT CHRD
+NEE DUK SO D AEP EXC XEL ED PEG WEC ES AEE CMS DTE PPL FE VST CEG NRG TLN
+CAT DE HON GE MMM EMR ETN PH ROK DOV ITW PNR XYL IEX FLS GEV PWR
+BA LMT RTX NOC GD LHX TDG HWM HEI TXT SPR AXON RKLB LUNR ASTS PL RDW
+UPS FDX UNP CSX NSC ODFL JBHT XPO CHRW EXPD LSTR SAIA
+DAL UAL AAL LUV ALK JBLU SAVE ALGT
+WMT COST TGT DG DLTR BJ KR ACI SFM CASY
+HD LOW TSCO ORLY AZO AAP GPC BBY WSM RH CHWY W ETSY EBAY
+NKE LULU DECK ONON SKX CROX VFC PVH RL TPR CPRI GPS ANF AEO URBN BIRK
+SBUX MCD YUM CMG QSR DPZ WEN JACK SHAK CAVA DRI EAT TXRH BLMN WING SG CELH
+PG KO PEP KDP MNST KHC GIS K CPB CAG SJM HSY MDLZ STZ TAP MO PM
+DIS NFLX CMCSA WBD PARA FOX LYV SPOT ROKU FUBO T VZ TMUS
+AMT CCI SBAC EQIX DLR PLD SPG O VICI WELL VTR ARE BXP KIM REG FRT IRM
+LIN APD SHW ECL DD DOW LYB PPG NUE STLD X CLF AA FCX SCCO NEM GOLD AEM
+RIO BHP VALE MP ALB SQM UEC CCJ LEU OKLO SMR NNE
+UBER LYFT DASH ABNB BKNG EXPE MAR HLT H WH CZR MGM LVS WYNN PENN DKNG RCL CCL NCLH
+F GM RIVN LCID NIO XPEV LI STLA HMC TM BLNK CHPT
+MARA RIOT CLSK HUT BITF WULF CIFR IREN CORZ MSTR GLXY BTDR
+ENPH SEDG FSLR RUN NOVA ARRY SHLS CSIQ JKS DQ PLUG FCEL BE BLDP
+LAZR OUST INDI AEVA MVIS IONQ RGTI QBTS QUBT
+ANET CSCO JNPR FFIV CIEN LITE INFN VIAV COHR VRT FIVN
+IBM ACN CTSH INFY WIT EPAM DXC ZM DOCU TWLO FSLY AKAM
+GME AMC KOSS BYND TLRY ACB CGC SNDL OPEN WISH CLOV
+NVO AZN SNY GSK NVS TAK BABA JD PDD BIDU NTES TME BILI IQ TCOM YMM
+SE MELI GRAB CPNG STNE PAGS VIST GGAL BMA PAM YPF TS TX
+""".split()
 
-@dataclass(frozen=True)
-class ScanConfig:
-    min_price: float = 5.0
-    max_price: float = 500.0
-    min_dollar_volume_m: float = 15.0
-    min_share_volume_m: float = 0.5
-
-    setup_window: int = 150
-    peak_age_min: int = 2
-    peak_age_max: int = 20
-
-    leg_bars_min: int = 3
-    leg_bars_max: int = 30
-    rise_min_pct: float = 10.0
-
-    retrace_min_pct: float = 15.0
-    retrace_max_pct: float = 65.0
-
-    dry_ratio_min: float = 1.15
-    spike_ratio_min: float = 1.5
-
-    atr_min_abs: float = 0.30
-    atr_min_pct: float = 2.0
-    support_distance_max_pct: float = 7.0
-
-    bb_side: str = "off"
-    bb_required: bool = False
-    bb_lookback: int = 3
-
-    reversal_required: bool = True
-    min_body_pct: float = 0.15
-    min_lower_wick_pct: float = 0.40
-
-    rr_min: float = 1.5
-    breakout_buffer_atr: float = 0.05
-    stop_buffer_atr: float = 0.25
-    max_stop_atr: float = 4.0
-
-    earnings_filter: bool = False
-
-
-PRESETS: dict[str, ScanConfig] = {
-    "מסחר יומי מומנטום": ScanConfig(
-        min_price=5,
-        min_dollar_volume_m=20,
-        min_share_volume_m=0.75,
-        peak_age_min=1,
-        peak_age_max=15,
-        leg_bars_min=3,
-        rise_min_pct=10,
-        retrace_min_pct=12,
-        retrace_max_pct=60,
-        dry_ratio_min=1.15,
-        spike_ratio_min=1.5,
-        atr_min_abs=0.30,
-        atr_min_pct=2.5,
-        support_distance_max_pct=6,
-        rr_min=1.5,
-    ),
-    "לפני פריצה": ScanConfig(
-        min_price=7,
-        min_dollar_volume_m=15,
-        min_share_volume_m=0.5,
-        peak_age_min=3,
-        peak_age_max=25,
-        leg_bars_min=4,
-        rise_min_pct=12,
-        retrace_min_pct=18,
-        retrace_max_pct=55,
-        dry_ratio_min=1.25,
-        spike_ratio_min=1.7,
-        atr_min_abs=0.30,
-        atr_min_pct=1.8,
-        support_distance_max_pct=10,
-        rr_min=1.8,
-    ),
-    "רחב": ScanConfig(
-        min_price=3,
-        min_dollar_volume_m=8,
-        min_share_volume_m=0.25,
-        peak_age_min=1,
-        peak_age_max=35,
-        leg_bars_min=2,
-        rise_min_pct=6,
-        retrace_min_pct=10,
-        retrace_max_pct=80,
-        dry_ratio_min=1.05,
-        spike_ratio_min=1.1,
-        atr_min_abs=0.15,
-        atr_min_pct=1.2,
-        support_distance_max_pct=16,
-        rr_min=1.0,
-        reversal_required=False,
-    ),
+PRESETS = {
+    "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", bbmode="בונוס", price=10.0, dv=15.0,
+                       sh=0.3, atr=1.0, atrp=2.0, rise=12, age=(3, 20), retr=(20, 70),
+                       rr=1.5, off=12),
+    "רחב": dict(dry=1.05, bb="אחת מהשתיים", bbmode="בונוס", price=5.0, dv=8.0, sh=0.2,
+                atr=0.4, atrp=1.5, rise=6, age=(2, 35), retr=(12, 88), rr=1.0, off=20),
+    "מחמיר": dict(dry=1.45, bb="רצועה תחתונה", bbmode="חובה", price=15.0, dv=40.0, sh=1.0,
+                  atr=1.5, atrp=3.0, rise=20, age=(3, 15), retr=(30, 65), rr=2.0, off=8),
 }
 
 
-# ============================================================
-# DATA
-# ============================================================
-
-def chunked(values: list[str], size: int) -> Iterable[tuple[str, ...]]:
-    for start in range(0, len(values), size):
-        yield tuple(values[start:start + size])
-
-
-def normalize_symbol(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-
-    symbol = value.strip().upper()
-
-    if not symbol or symbol in {"FILE CREATION TIME", "SYMBOL", "ACT SYMBOL"}:
-        return None
-
-    # Yahoo commonly uses "-" instead of "." for class shares.
-    symbol = symbol.replace(".", "-")
-
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ-")
-    if not all(ch in allowed for ch in symbol):
-        return None
-
-    return symbol
-
-
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def build_universe(limit: int = DEFAULT_SCAN_SIZE) -> list[str]:
-    urls = [
-        (
-            "[nasdaqtrader.com](https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt)",
-            "Symbol",
-        ),
-        (
-            "[nasdaqtrader.com](https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt)",
-            "ACT Symbol",
-        ),
-    ]
-
-    symbols: list[str] = []
-
-    for url, symbol_column in urls:
-        response = requests.get(
-            url,
-            headers=UA,
-            timeout=20,
-        )
-        response.raise_for_status()
-
-        frame = pd.read_csv(io.StringIO(response.text), sep="|")
-
-        if symbol_column not in frame.columns:
-            raise ValueError(f"Missing symbol column: {symbol_column}")
-
-        for raw_symbol in frame[symbol_column].dropna():
-            symbol = normalize_symbol(raw_symbol)
-            if symbol:
-                symbols.append(symbol)
-
-    # Keep original exchange-file order while removing duplicates.
-    unique_symbols = list(dict.fromkeys(symbols))
-
-    if not unique_symbols:
-        raise RuntimeError("Universe download returned no symbols.")
-
-    return unique_symbols[:limit]
-
-
-def normalize_download(
-    raw: pd.DataFrame,
-    tickers: tuple[str, ...],
-) -> dict[str, pd.DataFrame]:
-    output: dict[str, pd.DataFrame] = {}
-
-    if raw is None or raw.empty:
-        return output
-
-    if isinstance(raw.columns, pd.MultiIndex):
-        level_zero = set(raw.columns.get_level_values(0))
-
-        for ticker in tickers:
-            if ticker not in level_zero:
-                continue
-
-            frame = raw[ticker].copy()
-            frame = frame.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-
-            if not frame.empty:
-                output[ticker] = frame
-
-        return output
-
-    # Single-ticker response.
-    if len(tickers) == 1:
-        frame = raw.copy()
-        frame = frame.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-
-        if not frame.empty:
-            output[tickers[0]] = frame
-
-    return output
-
-
-@st.cache_data(ttl=30 * 60, max_entries=160, show_spinner=False)
-def fetch_batch(
-    tickers: tuple[str, ...],
-    period: str = "1y",
-) -> dict[str, pd.DataFrame]:
-    if not tickers:
-        return {}
-
-    try:
-        raw = yf.download(
-            tickers=list(tickers),
-            period=period,
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=False,
-            actions=False,
-            threads=True,
-            progress=False,
-            timeout=25,
-        )
-        return normalize_download(raw, tickers)
-
-    except Exception:
-        # Retry individually so one bad ticker does not destroy the batch.
-        recovered: dict[str, pd.DataFrame] = {}
-
-        for ticker in tickers:
-            try:
-                raw = yf.download(
-                    tickers=ticker,
-                    period=period,
-                    interval="1d",
-                    auto_adjust=False,
-                    actions=False,
-                    threads=False,
-                    progress=False,
-                    timeout=15,
-                )
-                recovered.update(normalize_download(raw, (ticker,)))
-            except Exception:
-                continue
-
-        return recovered
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def prepare_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    required = ["Open", "High", "Low", "Close", "Volume"]
-
-    if not set(required).issubset(frame.columns):
-        raise ValueError("OHLCV columns are missing.")
-
-    out = frame[required].copy()
-
-    for column in required:
-        out[column] = pd.to_numeric(out[column], errors="coerce")
-
-    out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.dropna(subset=required)
-    out = out[out["Volume"] >= 0]
-
-    if len(out) < 60:
-        raise ValueError("Not enough history.")
-
-    previous_close = out["Close"].shift(1)
-
-    true_range = pd.concat(
-        [
-            out["High"] - out["Low"],
-            (out["High"] - previous_close).abs(),
-            (out["Low"] - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    # Wilder ATR.
-    out["ATR14"] = true_range.ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14,
-    ).mean()
-
-    out["SMA20"] = out["Close"].rolling(20).mean()
-    out["STD20"] = out["Close"].rolling(20).std(ddof=0)
-    out["BBU"] = out["SMA20"] + 2 * out["STD20"]
-    out["BBL"] = out["SMA20"] - 2 * out["STD20"]
-
-    out["SMA50"] = out["Close"].rolling(50).mean()
-    out["SMA200"] = out["Close"].rolling(200).mean()
-
-    out["AVG_VOL20"] = out["Volume"].rolling(20).mean()
-    out["AVG_VOL50"] = out["Volume"].rolling(50).mean()
-    out["DOLLAR_VOL20"] = (out["Close"] * out["Volume"]).rolling(20).mean()
-
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_full_market():
+    """NASDAQ Trader's official symbol directory — every common stock listed on
+    NASDAQ, NYSE, NYSE American and NYSE Arca. This is the source that gets the
+    universe past a few hundred names into the thousands."""
+    out = []
+    for url, sym_col, etf_col, test_col in [
+        ("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+         "Symbol", "ETF", "Test Issue"),
+        ("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+         "ACT Symbol", "ETF", "Test Issue"),
+    ]:
+        try:
+            txt = requests.get(url, headers=UA, timeout=25).text
+            df = pd.read_csv(io.StringIO(txt), sep="|")
+            df = df[df[test_col].astype(str).str.upper() != "Y"]
+            if etf_col in df.columns:
+                df = df[df[etf_col].astype(str).str.upper() != "Y"]
+            syms = [str(x).strip().upper().replace(".", "-") for x in df[sym_col]]
+            syms = [x for x in syms if x.isascii() and 1 <= len(x) <= 5
+                    and x.replace("-", "").isalpha()]
+            out += syms
+        except Exception:
+            pass
     return out
 
 
-def detect_reversal(
-    row: pd.Series,
-    previous_row: pd.Series,
-    cfg: ScanConfig,
-) -> tuple[bool, str]:
-    open_price = float(row["Open"])
-    high = float(row["High"])
-    low = float(row["Low"])
-    close = float(row["Close"])
+@st.cache_data(ttl=86400, show_spinner=False)
+def build_universe(limit):
+    got, log = [], []
+    for name, url, cols in [
+        ("S&P500", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", ("Symbol", "Ticker")),
+        ("S&P400", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", ("Symbol", "Ticker")),
+        ("S&P600", "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", ("Symbol", "Ticker")),
+        ("NDX", "https://en.wikipedia.org/wiki/Nasdaq-100", ("Ticker", "Symbol"))]:
+        n0 = 0
+        try:
+            html = requests.get(url, headers=UA, timeout=25).text
+            for tbl in pd.read_html(io.StringIO(html)):
+                hit = False
+                for col in cols:
+                    if col in tbl.columns:
+                        s = [str(x).strip().upper().replace(".", "-") for x in tbl[col]]
+                        s = [x for x in s if x.isascii() and 1 <= len(x) <= 6
+                             and x.replace("-", "").isalpha()]
+                        if len(s) > 50:
+                            got += s
+                            n0 = len(s)
+                            hit = True
+                        break
+                if hit:
+                    break
+        except Exception:
+            pass
+        log.append(f"{name}:{n0 or '—'}")
 
-    candle_range = high - low
+    full = fetch_full_market()
+    got += full
+    log.append(f"NASDAQ/NYSE:{len(full) or '—'}")
 
-    if candle_range <= 0:
+    got += [t.upper() for t in BACKUP]
+    log.append(f"רשימת גיבוי:{len(BACKUP)}")
+
+    seen, out = set(), []
+    for t in got:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    total_available = len(out)
+    if total_available > limit:
+        log.append(f"זמינות בפועל {total_available:,} (מוגבל ל-{limit:,})")
+    return out[:limit], log
+
+
+@st.cache_data(ttl=1800, max_entries=30, show_spinner=False)
+def fetch(tickers, period="1y"):
+    out = {}
+    try:
+        raw = yf.download(list(tickers), period=period, interval="1d", group_by="ticker",
+                          auto_adjust=False, threads=True, progress=False, timeout=45)
+    except Exception:
+        return out
+    if raw is None or len(raw) == 0:
+        return out
+    for t in tickers:
+        try:
+            d = (raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw).dropna()
+            if len(d) >= 90:
+                out[t] = d
+        except Exception:
+            pass
+    return out
+
+
+@st.cache_data(ttl=900, max_entries=40, show_spinner=False)
+def fetch_one(t, period, interval):
+    """Single ticker, any interval. Tries two different Yahoo endpoints with
+    backoff before giving up — the two methods sometimes succeed independently
+    of each other when Yahoo is rate-limiting one path."""
+    for attempt in range(3):
+        try:
+            d = yf.download(t, period=period, interval=interval, auto_adjust=False,
+                            progress=False, timeout=20, threads=False)
+            if d is not None and len(d):
+                if isinstance(d.columns, pd.MultiIndex):
+                    d.columns = d.columns.get_level_values(0)
+                d = d.dropna()
+                if len(d) >= 5:
+                    return d
+        except Exception:
+            pass
+        try:
+            d = yf.Ticker(t).history(period=period, interval=interval, auto_adjust=False)
+            if d is not None and len(d):
+                d = d.dropna()
+                if len(d) >= 5:
+                    return d
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(0.6 + attempt * 0.6)
+    return None
+
+
+def get_chart_data(r, period_key, interval, ranges):
+    """Fetch chart data for one ticker. fetch_one is cached and retries across
+    two Yahoo endpoints, so this is the reliable path; we no longer keep price
+    DataFrames in session_state because that grew memory without bound."""
+    return fetch_one(r["ticker"], ranges[period_key], interval)
+
+
+def prep(d):
+    c, o = d["Close"].values.astype(float), d["Open"].values.astype(float)
+    h, l = d["High"].values.astype(float), d["Low"].values.astype(float)
+    v = d["Volume"].values.astype(float)
+    pc = np.concatenate([[c[0]], c[:-1]])
+    tr = np.maximum.reduce([h - l, np.abs(h - pc), np.abs(l - pc)])
+    cs = pd.Series(c)
+    mid, sd = cs.rolling(20).mean(), cs.rolling(20).std()
+    return dict(c=c, o=o, h=h, l=l, v=v,
+                atr=pd.Series(tr).rolling(14).mean().values,
+                bbu=(mid + 2 * sd).values, bbl=(mid - 2 * sd).values,
+                sma200=cs.rolling(200).mean().values)
+
+
+def reversal_candle(A, i):
+    """Classify the signal bar. A small green candle is not a reversal — we
+    require either a decisive bullish body closing in the upper part of its
+    range, a true hammer (long lower wick, small body), or a bullish engulfing
+    of the prior down bar. Returns (is_reversal, name)."""
+    o, h, l, c = A["o"][i], A["h"][i], A["l"][i], A["c"][i]
+    rng = h - l
+    if rng <= 0:
         return False, "נר לא תקין"
+    body = abs(c - o)
+    body_pct = body / rng
+    lower_wick = min(o, c) - l
+    upper_wick = h - max(o, c)
+    closes_high = c >= l + 0.60 * rng
 
-    body = abs(close - open_price)
-    lower_wick = min(open_price, close) - low
-    upper_wick = high - max(open_price, close)
+    if i >= 1:
+        po, pc = A["o"][i - 1], A["c"][i - 1]
+        if pc < po and c > o and o <= pc and c >= po:
+            return True, "בליעה שורית"
 
-    body_pct = body / candle_range
-    lower_wick_pct = lower_wick / candle_range
-
-    previous_open = float(previous_row["Open"])
-    previous_close = float(previous_row["Close"])
-
-    bullish_body = (
-        close > open_price
-        and body_pct >= cfg.min_body_pct
-        and close >= low + 0.60 * candle_range
-    )
-
-    hammer = (
-        lower_wick_pct >= cfg.min_lower_wick_pct
-        and close >= low + 0.60 * candle_range
-        and lower_wick >= max(1.5 * body, upper_wick)
-    )
-
-    bullish_engulfing = (
-        previous_close < previous_open
-        and close > open_price
-        and open_price <= previous_close
-        and close >= previous_open
-    )
-
-    if bullish_engulfing:
-        return True, "בליעה שורית"
-
-    if hammer:
+    if rng > 0 and (lower_wick / rng) >= 0.40 and closes_high \
+       and lower_wick >= max(1.5 * body, upper_wick):
         return True, "פטיש"
 
-    if bullish_body:
+    if c > o and body_pct >= 0.15 and closes_high:
         return True, "נר שורי"
 
     return False, "אין נר היפוך"
 
 
-def bollinger_tags(
-    window: pd.DataFrame,
-    lookback: int,
-    side: str,
-) -> list[str]:
-    if side == "off":
-        return []
-
-    recent = window.tail(lookback)
-    tags: list[str] = []
-
-    if side in {"lower", "both"}:
-        if (recent["Low"] <= recent["BBL"]).fillna(False).any():
-            tags.append("תחתונה")
-
-    if side in {"upper", "both"}:
-        if (recent["High"] >= recent["BBU"]).fillna(False).any():
-            tags.append("עליונה")
-
-    return tags
+def bb_hits(A, i, look, side):
+    out = []
+    for j in range(max(0, i - look + 1), i + 1):
+        lo_b, up_b = A["bbl"][j], A["bbu"][j]
+        if side in ("lower", "both") and np.isfinite(lo_b) and A["l"][j] <= lo_b and A["c"][j] > lo_b:
+            out.append("תחתונה")
+        if side in ("upper", "both") and np.isfinite(up_b) and A["h"][j] >= up_b and A["c"][j] < up_b:
+            out.append("עליונה")
+    return sorted(set(out))
 
 
-def score_setup(result: dict[str, Any]) -> float:
-    score = 0.0
-
-    score += min(result["dry"] / 2.0, 1.0) * 18
-    score += min(result["spike"] / 4.0, 1.0) * 15
-    score += min(result["rr"] / 3.0, 1.0) * 20
-    score += min(result["dollar_volume_m"] / 100.0, 1.0) * 10
-    score += min(result["atr_pct"] / 6.0, 1.0) * 10
-    score += min(result["rvol"] / 2.0, 1.0) * 8
-    score += max(0.0, 1.0 - result["support_distance_pct"] / 15.0) * 10
-    score += max(0.0, 1.0 - result["to_entry_pct"] / 8.0) * 9
-
-    return round(float(np.clip(score, 0, 100)), 1)
-
-
-def evaluate_setup(
-    prepared: pd.DataFrame,
-    index: int,
-    cfg: ScanConfig,
-) -> tuple[dict[str, Any] | None, str]:
-    if index < 59:
+def core(A, i, C):
+    c, o, h, l, v = A["c"], A["o"], A["h"], A["l"], A["v"]
+    if i < 80:
         return None, "היסטוריה קצרה"
-
-    start = max(0, index - cfg.setup_window + 1)
-    window = prepared.iloc[start:index + 1].copy()
-
-    if len(window) < 60:
-        return None, "היסטוריה קצרה"
-
-    current = window.iloc[-1]
-    previous = window.iloc[-2]
-
-    close = float(current["Close"])
-    atr = float(current["ATR14"])
-
-    if not np.isfinite(close) or close <= 0:
-        return None, "מחיר לא תקין"
-
-    if not np.isfinite(atr) or atr <= 0:
-        return None, "אין ATR"
-
-    if close < cfg.min_price:
-        return None, "מחיר נמוך"
-
-    if close > cfg.max_price:
-        return None, "מחיר גבוה"
-
-    avg_volume20 = float(current["AVG_VOL20"])
-    dollar_volume20 = float(current["DOLLAR_VOL20"])
-
-    if not np.isfinite(avg_volume20):
-        return None, "אין נפח ממוצע"
-
-    if not np.isfinite(dollar_volume20):
-        return None, "אין מחזור דולרי"
-
-    if avg_volume20 < cfg.min_share_volume_m * 1_000_000:
-        return None, "מחזור מניות נמוך"
-
-    if dollar_volume20 < cfg.min_dollar_volume_m * 1_000_000:
-        return None, "מחזור דולרי נמוך"
-
-    atr_pct = atr / close * 100
-
-    if atr < cfg.atr_min_abs:
-        return None, "ATR כספי נמוך"
-
-    if atr_pct < cfg.atr_min_pct:
-        return None, "תנודתיות נמוכה"
-
-    n = len(window)
-    peak_right = n - 1 - cfg.peak_age_min
-    peak_left = n - 1 - cfg.peak_age_max
-
-    peak_left = max(0, peak_left)
-    peak_right = min(n - 1, peak_right)
-
-    if peak_right < peak_left:
-        return None, "טווח שיא לא תקין"
-
-    peak_search = window.iloc[peak_left:peak_right + 1]
-
-    if peak_search.empty:
-        return None, "אין טווח שיא"
-
-    # Use the actual daily high, not closing price.
-    peak_label = peak_search["High"].idxmax()
-    peak_pos = window.index.get_loc(peak_label)
-    peak_price = float(window.iloc[peak_pos]["High"])
-    peak_age = n - 1 - peak_pos
-
-    leg_start = max(0, peak_pos - cfg.leg_bars_max)
-    leg_search = window.iloc[leg_start:peak_pos + 1]
-
-    if leg_search.empty:
-        return None, "אין רגל עלייה"
-
-    low_label = leg_search["Low"].idxmin()
-    low_pos = window.index.get_loc(low_label)
-    low_price = float(window.iloc[low_pos]["Low"])
-    leg_bars = peak_pos - low_pos
-
-    if leg_bars < cfg.leg_bars_min:
+    s = max(0, i - C["win"] + 1)
+    cw, ow, lw, vw = c[s:i + 1], o[s:i + 1], l[s:i + 1], v[s:i + 1]
+    n = len(cw)
+    # Search for the peak ONLY inside the allowed recency window, instead of
+    # finding the global high of the whole lookback and then rejecting it for
+    # being old. This directly finds fresh local highs even when an older,
+    # bigger high exists earlier in the window — which is exactly the recent
+    # pullback we're looking for, not ancient history.
+    hi_idx = max(0, n - 1 - C["age_lo"])
+    lo_idx = max(0, n - 1 - C["age_hi"])
+    if hi_idx <= lo_idx:
+        return None, "טווח ימים לא תקין"
+    window = cw[lo_idx:hi_idx]
+    if len(window) == 0:
+        return None, "אין טווח לשיא"
+    peak = lo_idx + int(np.argmax(window))
+    age = n - 1 - peak
+    st_ = max(0, peak - C["leg_max"])
+    if peak - st_ < C["leg_min"]:
+        return None, "אין מקום לזינוק"
+    low_i = st_ + int(np.argmin(cw[st_:peak]))
+    leg_bars = peak - low_i
+    if leg_bars < C["leg_min"]:
         return None, "זינוק קצר מדי"
-
-    if low_price <= 0 or peak_price <= low_price:
-        return None, "רגל מחיר לא תקינה"
-
-    rise_pct = (peak_price / low_price - 1) * 100
-
-    if rise_pct < cfg.rise_min_pct:
+    lo_px, pk_px, px = float(cw[low_i]), float(cw[peak]), float(cw[-1])
+    if lo_px <= 0 or pk_px <= lo_px:
+        return None, "אין זינוק"
+    rise = (pk_px / lo_px - 1) * 100
+    if rise < C["rise_min"]:
         return None, "זינוק קטן מדי"
-
-    retrace_pct = (peak_price - close) / (peak_price - low_price) * 100
-
-    if retrace_pct < cfg.retrace_min_pct:
+    retr = (pk_px - px) / (pk_px - lo_px) * 100
+    if retr < C["retr_lo"]:
         return None, "כמעט לא תיקנה"
-
-    if retrace_pct > cfg.retrace_max_pct:
-        return None, "תיקון עמוק מדי"
-
-    pre_leg_volume = window["Volume"].iloc[max(0, low_pos - 50):low_pos]
-    leg_volume = window["Volume"].iloc[low_pos:peak_pos + 1]
-
-    # Exclude the peak bar from pullback average where possible.
-    pullback_volume = window["Volume"].iloc[peak_pos + 1:]
-
-    if len(pre_leg_volume) < 5:
-        pre_leg_volume = window["Volume"].iloc[:max(low_pos, 1)]
-
-    if pre_leg_volume.empty or leg_volume.empty or pullback_volume.empty:
-        return None, "אין מספיק נתוני נפח"
-
-    base_volume = max(float(pre_leg_volume.mean()), 1.0)
-    pullback_average = float(pullback_volume.mean())
-
-    if pullback_average <= 0:
-        return None, "אין נפח בתיקון"
-
-    spike_ratio = float(leg_volume.max() / base_volume)
-    dry_ratio = float(leg_volume.mean() / pullback_average)
-
-    if spike_ratio < cfg.spike_ratio_min:
-        return None, "אין קפיצת נפח"
-
-    if dry_ratio < cfg.dry_ratio_min:
+    if retr > C["retr_hi"]:
+        return None, "החזירה את כל הזינוק"
+    base = vw[max(0, low_i - 50):low_i]
+    base_v = float(base.mean()) if len(base) >= 5 else float(vw[:max(low_i, 1)].mean())
+    leg_v, pull_v = vw[low_i:peak + 1], vw[peak:]
+    if base_v <= 0 or len(leg_v) == 0 or len(pull_v) == 0 or pull_v.mean() <= 0:
+        return None, "אין נתוני נפח"
+    spike = float(leg_v.max() / base_v)
+    dry = float(leg_v.mean() / pull_v.mean())
+    if dry < C["dry_min"]:
         return None, "הנפח לא התייבש"
-
-    is_reversal, candle_name = detect_reversal(current, previous, cfg)
-
-    if cfg.reversal_required and not is_reversal:
-        return None, candle_name
-
-    bb_tags = bollinger_tags(window, cfg.bb_lookback, cfg.bb_side)
-
-    if cfg.bb_required and cfg.bb_side != "off" and not bb_tags:
-        return None, "אין מגע בולינגר"
-
-    post_peak = window.iloc[peak_pos:]
-
-    if post_peak.empty:
-        return None, "אין תיקון לאחר השיא"
-
-    # Recent support gives a more relevant stop than the lowest point
-    # of the entire pullback in many setups.
-    support_window = post_peak.tail(min(10, len(post_peak)))
-    support = float(support_window["Low"].min())
-
-    if support <= 0:
-        return None, "תמיכה לא תקינה"
-
-    support_distance_pct = (close / support - 1) * 100
-
-    if support_distance_pct > cfg.support_distance_max_pct:
-        return None, "רחוקה מהתמיכה"
-
-    current_high = float(current["High"])
-    entry = current_high + cfg.breakout_buffer_atr * atr
-
-    stop_candidate = support - cfg.stop_buffer_atr * atr
-    max_risk_stop = entry - cfg.max_stop_atr * atr
-    stop = max(stop_candidate, max_risk_stop)
-
-    risk_per_share = entry - stop
-
-    if risk_per_share <= 0:
+    tags = []
+    if C["bb"] != "off":
+        tags = bb_hits(A, i, C["bb_look"], C["bb"])
+        if C["bb_hard"] and not tags:
+            return None, "אין נר על בולינג׳ר"
+    sup = float(lw[peak:].min())
+    off_low = (px / sup - 1) * 100 if sup > 0 else 999
+    if off_low > C["off_max"]:
+        return None, "רחוקה מדי מהתמיכה"
+    a = float(A["atr"][i])
+    if not np.isfinite(a) or a <= 0:
+        return None, "אין ATR"
+    if a < C["atr_abs"]:
+        return None, "ATR נמוך מדי"
+    atr_pct = a / px * 100
+    if atr_pct < C["atr_pct"]:
+        return None, "תנודתיות נמוכה"
+    rvol = float(v[i - 2:i + 1].mean() / v[max(0, i - 49):i + 1].mean())
+    sma200 = float(A["sma200"][i]) if np.isfinite(A["sma200"][i]) else None
+    above200 = None if sma200 is None else (px > sma200)
+    if C.get("trend_hard") and sma200 is not None and not above200:
+        return None, "מתחת ל-SMA200"
+    rs = None
+    if C.get("spy_ret21") is not None and i >= 21:
+        stock_ret21 = (c[i] / c[i - 21] - 1) * 100
+        rs = stock_ret21 - C["spy_ret21"]
+        if C.get("rs_min") is not None and rs < C["rs_min"]:
+            return None, "חלשה מדי מול השוק"
+    is_rev, rev_name = reversal_candle(A, i)
+    if C.get("rev_hard") and not is_rev:
+        return None, "אין נר היפוך"
+    entry = max(px, float(h[i])) + .05 * a
+    stop = max(min(sup - .35 * a, entry - 3 * a), entry - 4 * a)
+    risk = entry - stop
+    if risk <= 0:
         return None, "סטופ לא תקין"
-
-    target_1 = peak_price
-    target_2 = peak_price + 0.5 * (peak_price - low_price)
-    target_3 = peak_price + 1.0 * (peak_price - low_price)
-
-    rr = (target_1 - entry) / risk_per_share
-
-    if rr < cfg.rr_min:
-        return None, "יחס סיכוי-סיכון נמוך"
-
-    avg_volume50 = float(current["AVG_VOL50"])
-    rvol = (
-        float(current["Volume"]) / avg_volume50
-        if np.isfinite(avg_volume50) and avg_volume50 > 0
-        else 0.0
-    )
-
-    to_entry_pct = (entry / close - 1) * 100
-
-    sma50 = float(current["SMA50"]) if np.isfinite(current["SMA50"]) else np.nan
-    sma200 = float(current["SMA200"]) if np.isfinite(current["SMA200"]) else np.nan
-
-    trend_ok = bool(
-        np.isfinite(sma50)
-        and close >= sma50
-        and (not np.isfinite(sma200) or sma50 >= sma200)
-    )
-
-    result: dict[str, Any] = {
-        "price": round(close, 2),
-        "entry": round(entry, 2),
-        "stop": round(stop, 2),
-        "tp1": round(target_1, 2),
-        "tp2": round(target_2, 2),
-        "tp3": round(target_3, 2),
-        "risk_share": round(risk_per_share, 2),
-        "rr": round(rr, 2),
-        "rise_pct": round(rise_pct, 1),
-        "retrace_pct": round(retrace_pct, 1),
-        "dry": round(dry_ratio, 2),
-        "spike": round(spike_ratio, 2),
-        "rvol": round(rvol, 2),
-        "atr_pct": round(atr_pct, 1),
-        "peak_age": int(peak_age),
-        "leg_bars": int(leg_bars),
-        "support": round(support, 2),
-        "support_distance_pct": round(support_distance_pct, 2),
-        "to_entry_pct": round(to_entry_pct, 2),
-        "dollar_volume_m": round(dollar_volume20 / 1_000_000, 1),
-        "avg_volume_m": round(avg_volume20 / 1_000_000, 2),
-        "candle": candle_name,
-        "bb": bb_tags,
-        "trend_ok": trend_ok,
-        "spark": [
-            round(float(value), 4)
-            for value in window["Close"].tail(60).to_numpy()
-        ],
-    }
-
-    result["score"] = score_setup(result)
-
-    return result, "עבר"
+    leg = pk_px - lo_px
+    tp1, tp2, tp3 = pk_px, pk_px + .5 * leg, pk_px + leg
+    rr = (tp1 - entry) / risk
+    if rr < C["rr_min"]:
+        return None, "אין מרווח ל-TP1"
+    return dict(dry=round(dry, 2), spike=round(spike, 2), rise=round(rise, 1),
+                leg_bars=int(leg_bars), retrace=round(retr, 1), price=round(px, 2),
+                entry=round(entry, 2), stop=round(stop, 2), tp1=round(tp1, 2),
+                tp2=round(tp2, 2), tp3=round(tp3, 2), rr=round(float(rr), 2),
+                rr3=round(float((tp3 - entry) / risk), 2), risk_share=round(float(risk), 2),
+                to_entry=round((entry / px - 1) * 100, 2), rvol=round(rvol, 2),
+                atr=round(a, 2), atr_pct=round(atr_pct, 1), age=int(age),
+                support=round(sup, 2), peak_px=round(pk_px, 2), base=round(lo_px, 2),
+                off_low=round(off_low, 1), above200=above200,
+                rs=(round(rs, 1) if rs is not None else None),
+                candle=rev_name, is_rev=bool(is_rev),
+                bb=tags, spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
 
 
-# ============================================================
-# BACKTEST
-# ============================================================
-
-def resolve_trade(
-    prepared: pd.DataFrame,
-    signal_index: int,
-    entry: float,
-    stop: float,
-    target: float,
-    max_hold_days: int,
-    slippage_bps: float,
-    commission_per_share: float,
-) -> dict[str, Any] | None:
-    end = min(signal_index + max_hold_days, len(prepared) - 1)
-
-    if signal_index + 1 > end:
-        return None
-
-    filled = False
-    fill_price = math.nan
-    fill_index = -1
-
-    for j in range(signal_index + 1, end + 1):
-        row = prepared.iloc[j]
-        day_open = float(row["Open"])
-        day_high = float(row["High"])
-        day_low = float(row["Low"])
-        day_close = float(row["Close"])
-
-        if not filled:
-            if day_high < entry:
-                continue
-
-            # Gap above the stop-entry gets a worse fill at the open.
-            raw_fill = max(entry, day_open)
-            fill_price = raw_fill * (1 + slippage_bps / 10_000)
-            fill_index = j
-            filled = True
-
-        actual_stop = stop * (1 - slippage_bps / 10_000)
-        actual_target = target * (1 - slippage_bps / 10_000)
-        risk = fill_price - actual_stop
-
-        if risk <= 0:
-            return None
-
-        hit_stop = day_low <= stop
-        hit_target = day_high >= target
-
-        if hit_stop and hit_target:
-            # Daily bars do not reveal which happened first.
-            # Conservative assumption: stop occurred first.
-            exit_price = actual_stop
-            outcome = "stop_same_bar"
-            r_multiple = (exit_price - fill_price) / risk
-            r_multiple -= (2 * commission_per_share) / risk
-
-            return {
-                "R": r_multiple,
-                "outcome": outcome,
-                "hold_days": j - fill_index + 1,
-            }
-
-        if hit_stop:
-            exit_price = actual_stop
-            r_multiple = (exit_price - fill_price) / risk
-            r_multiple -= (2 * commission_per_share) / risk
-
-            return {
-                "R": r_multiple,
-                "outcome": "stop",
-                "hold_days": j - fill_index + 1,
-            }
-
-        if hit_target:
-            exit_price = actual_target
-            r_multiple = (exit_price - fill_price) / risk
-            r_multiple -= (2 * commission_per_share) / risk
-
-            return {
-                "R": r_multiple,
-                "outcome": "target",
-                "hold_days": j - fill_index + 1,
-            }
-
-        if j == end:
-            exit_price = day_close * (1 - slippage_bps / 10_000)
-            r_multiple = (exit_price - fill_price) / risk
-            r_multiple -= (2 * commission_per_share) / risk
-
-            return {
-                "R": r_multiple,
-                "outcome": "time_exit",
-                "hold_days": j - fill_index + 1,
-            }
-
+@st.cache_data(ttl=86400, max_entries=200, show_spinner=False)
+def days_to_earnings(ticker):
+    """Trading-unaware calendar days until the next known earnings date, or None
+    if unavailable. Only ever called on the small matched subset — never on the
+    full scanned universe — because this is one extra network call per ticker."""
+    try:
+        t = yf.Ticker(ticker)
+        try:
+            ed = t.get_earnings_dates(limit=4)
+            if ed is not None and len(ed):
+                future = [d for d in ed.index if d.date() >= datetime.now().date()]
+                if future:
+                    return (min(future).date() - datetime.now().date()).days
+        except Exception:
+            pass
+        cal = t.calendar
+        if isinstance(cal, dict) and cal.get("Earnings Date"):
+            dts = cal["Earnings Date"]
+            dt = dts[0] if isinstance(dts, (list, tuple)) else dts
+            return (dt - datetime.now().date()).days
+    except Exception:
+        pass
     return None
 
 
-def backtest_symbol(
-    ticker: str,
-    frame: pd.DataFrame,
-    cfg: ScanConfig,
-    max_hold_days: int,
-    cooldown_days: int,
-    slippage_bps: float,
-    commission_per_share: float,
-) -> list[dict[str, Any]]:
-    prepared = prepare_frame(frame)
-    trades: list[dict[str, Any]] = []
-    last_signal = -10_000
+def ltr(txt):
+    """Wrap a numeric/LTR fragment so it doesn't get reordered inside RTL text."""
+    return f'<bdi dir="ltr">{txt}</bdi>'
 
-    # Leave enough future bars for trade resolution.
-    final_signal_index = len(prepared) - max_hold_days - 1
 
-    for i in range(200, max(200, final_signal_index + 1)):
-        if i - last_signal < cooldown_days:
+def day_trade_plan(r):
+    """Tight ATR-based plan for a max-4-day hold, separate from the swing TP1/2/3."""
+    a = r["atr"]
+    entry = r["entry"]
+    stop = round(entry - 1.7 * a, 2)
+    t1 = round(entry + 1.0 * a, 2)
+    t2 = round(entry + 2.0 * a, 2)
+    t3 = round(entry + 3.2 * a, 2)
+    risk = entry - stop
+    return dict(entry=entry, stop=stop, t1=t1, t2=t2, t3=t3, risk=round(risk, 2),
+                rr1=round((t1 - entry) / risk, 2) if risk > 0 else 0,
+                rr2=round((t2 - entry) / risk, 2) if risk > 0 else 0,
+                rr3=round((t3 - entry) / risk, 2) if risk > 0 else 0)
+
+
+def core_breakdown(A, i, C):
+    """Support broken, then reclaimed: potential failed-breakdown reversal."""
+    c, o, h, l, v = A["c"], A["o"], A["h"], A["l"], A["v"]
+    if i < 80:
+        return None, "היסטוריה קצרה"
+    s = max(0, i - C["win"] + 1)
+    cw, ow, lw, hw, vw = c[s:i + 1], o[s:i + 1], l[s:i + 1], h[s:i + 1], v[s:i + 1]
+    n = len(cw)
+    if n < C["sup_win"] + C["break_win"] + 5:
+        return None, "היסטוריה קצרה לתבנית"
+
+    pre_end = n - C["break_win"]
+    pre_start = max(0, pre_end - C["sup_win"])
+    if pre_end - pre_start < 10:
+        return None, "אין מספיק נתוני תמיכה"
+    support = float(np.min(lw[pre_start:pre_end]))
+    if support <= 0:
+        return None, "תמיכה לא תקינה"
+
+    brk_low = float(np.min(lw[pre_end:]))
+    brk_pct = (support - brk_low) / support * 100
+    if brk_pct < C["break_min"]:
+        return None, "לא נשברה תמיכה מספיק"
+    if brk_pct > C["break_max"]:
+        return None, "שבירה עמוקה מדי"
+
+    px = float(cw[-1])
+    reclaim_dist = (px / support - 1) * 100
+    if reclaim_dist < C["reclaim_lo"]:
+        return None, "עוד לא תפסה מחדש"
+    if reclaim_dist > C["reclaim_hi"]:
+        return None, "כבר התרחקה מדי מהתמיכה"
+
+    base_v = float(np.mean(vw[max(0, pre_start - 30):pre_start])) if pre_start > 5 \
+             else float(np.mean(vw[:max(pre_start, 1)]))
+    brk_v = vw[pre_end:]
+    if base_v <= 0 or len(brk_v) == 0:
+        return None, "אין נתוני נפח"
+    brk_spike = float(np.max(brk_v) / base_v)
+
+    rvol = float(v[i - 2:i + 1].mean() / v[max(0, i - 49):i + 1].mean())
+    a = float(A["atr"][i])
+    if not np.isfinite(a) or a <= 0:
+        return None, "אין ATR"
+    if a < C["atr_abs"]:
+        return None, "ATR נמוך מדי"
+    atr_pct = a / px * 100
+    if atr_pct < C["atr_pct"]:
+        return None, "תנודתיות נמוכה"
+
+    is_rev, rev_name = reversal_candle(A, i)
+    if C["need_trig"] and not is_rev:
+        return None, "אין נר היפוך"
+
+    sma200 = float(A["sma200"][i]) if np.isfinite(A["sma200"][i]) else None
+    above200 = None if sma200 is None else (px > sma200)
+    if C.get("trend_hard") and sma200 is not None and not above200:
+        return None, "מתחת ל-SMA200"
+    rs = None
+    if C.get("spy_ret21") is not None and i >= 21:
+        stock_ret21 = (c[i] / c[i - 21] - 1) * 100
+        rs = stock_ret21 - C["spy_ret21"]
+        if C.get("rs_min") is not None and rs < C["rs_min"]:
+            return None, "חלשה מדי מול השוק"
+
+    entry = max(px, float(h[i])) + .05 * a
+    stop = min(brk_low - .3 * a, entry - 2.2 * a)
+    risk = entry - stop
+    if risk <= 0:
+        return None, "סטופ לא תקין"
+
+    resistance = float(np.max(hw[pre_start:pre_end]))
+    if resistance <= entry:
+        resistance = entry + 2.6 * risk
+    span = resistance - support
+    t1 = max(support + span * .4, entry + 1.0 * risk)
+    t2 = max(support + span * .7, entry + 1.8 * risk)
+    t3 = max(resistance, entry + 2.6 * risk)
+    rr = (t1 - entry) / risk
+    if rr < C["rr_min"]:
+        return None, "אין מרווח ליעד"
+
+    return dict(kind="breakdown", support=round(support, 2), brk_low=round(brk_low, 2),
+                brk_pct=round(brk_pct, 1), spike=round(brk_spike, 2),
+                reclaim_pct=round(reclaim_dist, 1), resistance=round(resistance, 2),
+                price=round(px, 2), entry=round(entry, 2), stop=round(stop, 2),
+                tp1=round(t1, 2), tp2=round(t2, 2), tp3=round(t3, 2),
+                rr=round(float(rr), 2), rr3=round(float((t3 - entry) / risk), 2),
+                risk_share=round(float(risk), 2), to_entry=round((entry / px - 1) * 100, 2),
+                rvol=round(rvol, 2), atr=round(a, 2), atr_pct=round(atr_pct, 1),
+                above200=above200, rs=(round(rs, 1) if rs is not None else None),
+                age=0, rise=round(brk_pct, 1), leg_bars=C["break_win"],
+                dry=round(brk_spike, 2), retrace=round(reclaim_dist, 1), bb=[],
+                off_low=round(reclaim_dist, 1),
+                peak_px=round(resistance, 2), base=round(brk_low, 2),
+                spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
+
+
+def why_breakdown(r):
+    return (f"שברה תמיכה ב-{r['brk_pct']:.1f}% בנפח פי {r['spike']:.1f}, "
+            f"תפסה אותה מחדש (עכשיו {r['reclaim_pct']:+.1f}% מעליה), "
+            f"התנגדות קרובה ב-{r['resistance']:.2f}")
+
+
+def why_he(r):
+    return (f"עלתה {r['rise']:.0f}% ב-{r['leg_bars']} ימים בנפח פי {r['spike']:.1f}, "
+            f"תיקנה {r['retrace']:.0f}% בנפח קטן פי {r['dry']:.2f}, "
+            f"ונתמכת ב-{r['support']:.2f}")
+
+
+def spy_return_lookup(spy_df):
+    """21-day rolling return of SPY, indexed by date, for point-in-time lookup
+    during the walk-forward backtest (as-of, tolerant of small calendar gaps)."""
+    sc = spy_df["Close"].astype(float)
+    ret = (sc / sc.shift(21) - 1) * 100
+    return ret.dropna()
+
+
+def backtest_walk(d, C, CB, ptype, spy_ret_series, hold=25, cooldown=10,
+                  slip_bps=5.0, commission=0.005):
+    """Walk a single ticker's full history bar by bar, calling the SAME core()/
+    core_breakdown() the live scanner uses — so a backtest 'pass' means exactly
+    what a live match means, nothing reimplemented separately."""
+    A = prep(d)
+    n = len(A["c"])
+    dates = d.index
+    out = []
+    last = -999
+    for i in range(90, n - hold - 1):
+        if i - last < cooldown:
             continue
-
-        result, _ = evaluate_setup(prepared, i, cfg)
-
-        if result is None:
+        spy_r21 = None
+        if spy_ret_series is not None:
+            try:
+                spy_r21 = float(spy_ret_series.asof(dates[i]))
+                if not np.isfinite(spy_r21):
+                    spy_r21 = None
+            except Exception:
+                spy_r21 = None
+        Ci = dict(C, spy_ret21=spy_r21)
+        found = None
+        if ptype in ("זינוק ותיקון לתמיכה", "שתי התבניות"):
+            r, _ = core(A, i, Ci)
+            if r is not None:
+                found = r
+        if found is None and ptype in ("שבירת תמיכה ותפיסה מחדש", "שתי התבניות"):
+            CBi = dict(CB, spy_ret21=spy_r21)
+            rb, _ = core_breakdown(A, i, CBi)
+            if rb is not None:
+                found = rb
+        if found is None:
             continue
-
-        resolved = resolve_trade(
-            prepared=prepared,
-            signal_index=i,
-            entry=float(result["entry"]),
-            stop=float(result["stop"]),
-            target=float(result["tp1"]),
-            max_hold_days=max_hold_days,
-            slippage_bps=slippage_bps,
-            commission_per_share=commission_per_share,
-        )
-
-        if resolved is None:
-            continue
-
-        trades.append(
-            {
-                "ticker": ticker,
-                "date": prepared.index[i],
-                "R": float(resolved["R"]),
-                "outcome": resolved["outcome"],
-                "hold_days": int(resolved["hold_days"]),
-                "score": float(result["score"]),
-                "dry": float(result["dry"]),
-                "rr_planned": float(result["rr"]),
-            }
-        )
-        last_signal = i
-
-    return trades
-
-
-def max_drawdown_r(returns: pd.Series) -> float:
-    equity = returns.cumsum()
-    drawdown = equity - equity.cummax()
-    return float(drawdown.min()) if not drawdown.empty else 0.0
-
-
-def summarize_backtest(trades: pd.DataFrame) -> dict[str, float]:
-    if trades.empty:
-        return {}
-
-    wins = trades["R"] > 0
-    losses = trades["R"] < 0
-
-    gross_profit = float(trades.loc[wins, "R"].sum())
-    gross_loss = abs(float(trades.loc[losses, "R"].sum()))
-
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else float("inf")
-    )
-
-    return {
-        "trades": float(len(trades)),
-        "win_rate": float(wins.mean() * 100),
-        "expectancy": float(trades["R"].mean()),
-        "median_r": float(trades["R"].median()),
-        "profit_factor": profit_factor,
-        "max_drawdown_r": max_drawdown_r(trades["R"]),
-        "avg_hold": float(trades["hold_days"].mean()),
-    }
+        entry, stop, tp1, tp2 = found["entry"], found["stop"], found["tp1"], found["tp2"]
+        h, l, c, o = A["h"], A["l"], A["c"], A["o"]
+        slip = slip_bps / 10000.0
+        filled, res, fill_px = False, None, None
+        for j in range(i + 1, min(i + 1 + hold, n)):
+            if not filled:
+                if h[j] < entry:
+                    continue
+                # A gap above the buy-stop fills at the open, not at the trigger.
+                fill_px = max(entry, float(o[j])) * (1 + slip)
+                filled = True
+            risk = fill_px - stop
+            if risk <= 0:
+                break
+            hit_stop = l[j] <= stop
+            hit_tp1 = h[j] >= tp1
+            if hit_stop:
+                # Same-bar stop and target: daily bars can't tell which came
+                # first, so assume the stop. Conservative on purpose.
+                exit_px = stop * (1 - slip)
+                res = (exit_px - fill_px - 2 * commission) / risk
+                break
+            if h[j] >= tp2:
+                exit_px = tp2 * (1 - slip)
+                res = (exit_px - fill_px - 2 * commission) / risk
+                break
+            if hit_tp1:
+                exit_px = tp1 * (1 - slip)
+                res = (exit_px - fill_px - 2 * commission) / risk
+                break
+        last = i
+        if filled and fill_px is not None:
+            risk = fill_px - stop
+            if risk > 0:
+                if res is None:
+                    j = min(i + hold, n - 1)
+                    exit_px = float(c[j]) * (1 - slip)
+                    res = (exit_px - fill_px - 2 * commission) / risk
+                out.append(dict(R=res, dry=found.get("dry"), rs=found.get("rs"),
+                                above200=found.get("above200"), rr=found["rr"]))
+    return out
 
 
-# ============================================================
-# PRESENTATION
-# ============================================================
-
-def sparkline(values: list[float]) -> str:
-    if len(values) < 2:
-        return '<div class="spark"></div>'
-
-    array = np.asarray(values, dtype=float)
-    array = array[np.isfinite(array)]
-
-    if len(array) < 2:
-        return '<div class="spark"></div>'
-
-    width = 320.0
-    height = 42.0
-    padding = 2.0
-
-    low = float(array.min())
-    high = float(array.max())
-    span = high - low if high > low else 1.0
-
-    xs = np.linspace(padding, width - padding, len(array))
-    ys = height - padding - ((array - low) / span) * (height - 2 * padding)
-
-    points = " ".join(
-        f"{x:.1f},{y:.1f}"
-        for x, y in zip(xs, ys)
-    )
-
-    color = "#10B981" if array[-1] >= array[0] else "#EF4444"
-
-    return (
-        '<div class="spark">'
-        f'<svg viewBox="0 0 {width:.0f} {height:.0f}" '
-        'preserveAspectRatio="none" role="img" aria-label="Price trend">'
-        f'<polyline fill="none" stroke="{color}" stroke-width="2.2" '
-        f'stroke-linejoin="round" stroke-linecap="round" points="{points}" />'
-        "</svg>"
-        "</div>"
-    )
-
-
-def setup_explanation(result: dict[str, Any]) -> str:
-    return (
-        f"זינוק של {result['rise_pct']:.1f}% עם קפיצת נפח פי "
-        f"{result['spike']:.1f}, תיקון של {result['retrace_pct']:.1f}% "
-        f"בנפח מתייבש, ונר {result['candle']} סמוך לתמיכה."
-    )
-
-
-def card_html(result: dict[str, Any], is_top: bool) -> str:
-    ticker = escape(str(result["ticker"]))
-    candle = escape(str(result["candle"]))
-    explanation = escape(setup_explanation(result))
-
-    trend_chip = (
-        '<span class="chip green">מגמה תומכת</span>'
-        if result["trend_ok"]
-        else '<span class="chip">ללא אישור מגמה</span>'
-    )
-
-    bb_chip = ""
-    if result["bb"]:
-        bb_text = escape(", ".join(result["bb"]))
-        bb_chip = f'<span class="chip">BB {bb_text}</span>'
-
-    top_class = " top" if is_top else ""
-
-    return f"""
-    <div class="card{top_class}">
-        <div class="card-head">
-            <div class="ticker">{ticker}</div>
-            <div>
-                <div class="score">{result['score']:.1f}</div>
-                <div class="score-label">ציון איכות</div>
-            </div>
-        </div>
-
-        {sparkline(result.get("spark", []))}
-
-        <div class="chips">
-            <span class="chip gold">{candle}</span>
-            <span class="chip">ATR {result['atr_pct']:.1f}%</span>
-            <span class="chip">RVOL {result['rvol']:.2f}</span>
-            <span class="chip">R:R {result['rr']:.2f}</span>
-            {trend_chip}
-            {bb_chip}
-        </div>
-
-        <div class="levels">
-            <div class="level">
-                <span>כניסה</span>
-                <b>${result['entry']:.2f}</b>
-            </div>
-            <div class="level">
-                <span>סטופ</span>
-                <b>${result['stop']:.2f}</b>
-            </div>
-            <div class="level">
-                <span>יעד ראשון</span>
-                <b>${result['tp1']:.2f}</b>
-            </div>
-        </div>
-
-        <div class="levels">
-            <div class="level">
-                <span>מניות</span>
-                <b>{result['shares']:,}</b>
-            </div>
-            <div class="level">
-                <span>סיכון מתוכנן</span>
-                <b>${result['risk_total']:,.0f}</b>
-            </div>
-            <div class="level">
-                <span>מרחק כניסה</span>
-                <b>{result['to_entry_pct']:.2f}%</b>
-            </div>
-        </div>
-
-        <div class="explain">{explanation}</div>
-    </div>
+def rank_verdict(r):
     """
+    Ranking grounded in the walk-forward backtest, not an invented composite score.
+    The ONLY range with repeated, large-sample positive expectancy was dry-up 1.3-1.6
+    (+0.25R to +0.39R across multiple runs, 100+ trades). Below 1.3 was negative in
+    two separate runs. Above 1.6 was negative in the one large-sample run we have
+    (-0.09R, n=28). This ranks by closeness to the PROVEN range, not by raw magnitude —
+    a high dry-up number is not automatically better.
+
+    Within a quality tier, freshness breaks near-ties: a pullback whose peak was
+    20 days ago and one whose peak was 41 days ago can have almost identical dry-up
+    (1.43 vs 1.45) — a trivial, meaningless difference — while looking completely
+    different on a chart. Distance-from-center is bucketed to 0.05 so noise-level
+    differences don't decide the ranking; age (ascending, fresher first) does instead.
+    """
+    age = r.get("age", 0)
+    if r.get("kind") == "breakdown":
+        return dict(tier="?", color="#8A6FB0", sort=(2, 0, age),
+                    headline="לא נבדק היסטורית",
+                    detail="תבנית שבירת התמיכה לא עברה עדיין בדיקה היסטורית (backtest) "
+                           "כמו תבנית הזינוק-ותיקון. המספרים כאן חושבו נכון, אבל אין לנו "
+                           "עדיין הוכחה סטטיסטית שהתבנית הזאת רווחית. התייחס אליה בזהירות "
+                           "יתרה עד שתיבדק.")
+    dry = r["dry"]
+    dist = abs(dry - 1.45)
+    dist_bucket = round(dist * 20) / 20  # nearest 0.05 — kills 1.43-vs-1.45-style noise
+    if 1.30 <= dry <= 1.60:
+        return dict(tier="A", color="#2FBF8F", sort=(0, dist_bucket, age),
+                    headline=f"יובש נפח {dry:.2f}× — בדיוק בטווח המוכח",
+                    detail=f"יובש הנפח ({dry:.2f}×) נמצא בטווח 1.30–1.60, האזור היחיד שהראה "
+                           f"תוחלת חיובית עקבית בבדיקה ההיסטורית (כ-0.25 עד 0.39R לעסקה, "
+                           f"על יותר מ-100 עסקאות בשתי ריצות נפרדות). בין מניות ברמה הזאת "
+                           f"המערכת מעדיפה את התיקון הטרי ביותר — {age} ימים מהשיא כאן.")
+    if (1.10 <= dry < 1.30) or (1.60 < dry <= 2.20):
+        return dict(tier="B", color="#D4A64B", sort=(1, dist_bucket, age),
+                    headline=f"יובש נפח {dry:.2f}× — מחוץ לטווח המוכח",
+                    detail=f"יובש הנפח ({dry:.2f}×) קרוב לטווח המוכח (1.30–1.60) אך מחוצה לו. "
+                           f"אין לנו נתון היסטורי חד-משמעי על הטווח הזה — בריצה אחת הוא "
+                           f"הראה תוצאה שלילית, במדגם קטן מדי כדי לקבוע. אפשרי, אך פחות בטוח.")
+    return dict(tier="C", color="#E0605F", sort=(2, dist_bucket, age),
+                headline=f"יובש נפח {dry:.2f}× — רחוק מהטווח שנבדק",
+                detail=f"יובש הנפח ({dry:.2f}×) רחוק מהטווח שהוכח (1.30–1.60). "
+                       f"{'מתחת לטווח' if dry < 1.10 else 'מעל לטווח'} — במקום שבו בדקנו "
+                       f"היסטורית, התוצאה הייתה שלילית. מספר גבוה או נמוך יותר אינו "
+                       f"אוטומטית טוב יותר; זה בדיוק הטעות שגילינו והפכה אותנו לזהירים.")
 
 
-def funnel_chart(drop_counts: Counter[str]) -> go.Figure | None:
-    if not drop_counts:
+def explain_ai(r, rank=None, total=None):
+    """A full written explanation combining every factor we actually computed —
+    no invented score, just the numbers put into plain sentences."""
+    parts = []
+    if rank is not None and total is not None:
+        parts.append(f"דירוג #{rank} מתוך {total} מניות שנמצאו בסריקה הזאת.")
+
+    reclaim_txt = ltr(f"{r.get('reclaim_pct', 0):+.1f}%")
+    to_entry_txt = ltr(f"{r['to_entry']:+.1f}%")
+
+    if r.get("kind") == "breakdown":
+        parts.append(
+            f"{r['ticker']} שברה תמיכה שנקבעה על פני כחודש בשיעור של {r['brk_pct']:.1f}%, "
+            f"בנפח שהגיע לפי {r['spike']:.1f} מהרגיל, ואז תפסה אותה מחדש — כרגע נסחרת "
+            f"{reclaim_txt} מעליה. זו תבנית 'שייקאאוט' קלאסית: מי שקנה מוקדם מדי נבהל "
+            f"ומכר בשבירה, ועכשיו המחיר מתאושש. חשוב לדעת: בניגוד לתבנית הזינוק-ותיקון, "
+            f"את התבנית הזאת עדיין לא בדקנו היסטורית — היא הגיונית מבחינה טכנית, אבל "
+            f"אין לנו אישוש סטטיסטי שהיא רווחית.")
+    else:
+        tier_txt = {
+            "A": ("המצב הכי אמין שיש למערכת: יובש הנפח בדיוק בטווח שהוכח רווחי "
+                  "(1.30–1.60) על יותר מ-100 עסקאות היסטוריות בשתי ריצות נפרדות."),
+            "B": ("מצב בינוני: יובש הנפח קרוב לטווח המוכח אך לא בתוכו. אין נתון "
+                  "היסטורי חד-משמעי על הטווח המדויק הזה."),
+            "C": ("מצב לא מבוסס: יובש הנפח רחוק מהטווח שנבדק. איפה שכן נבדק "
+                  "(מעל 1.6 או מתחת ל-1.1), התוצאה ההיסטורית הייתה שלילית."),
+        }.get(r.get("tier"), "")
+        parts.append(
+            f"{r['ticker']} עלתה {r['rise']:.0f}% תוך {r['leg_bars']} ימי מסחר בנפח "
+            f"שהגיע לשיא של פי {r['spike']:.1f} מהרגיל, ואז תיקנה {r['retrace']:.0f}% "
+            f"מהעלייה על נפח קטן פי {r['dry']:.2f}. {tier_txt}")
+
+    liq = []
+    if r["atr_pct"] >= 3:
+        liq.append(f"תנודתיות גבוהה יחסית (ATR {r['atr_pct']:.1f}%) — מתאימה לקצב מסחר יומי")
+    elif r["atr_pct"] < 2:
+        liq.append(f"תנודתיות נמוכה יחסית (ATR {r['atr_pct']:.1f}%) — התנועה עשויה להיות איטית")
+    if r["rvol"] < 0.85:
+        liq.append(f"נפח הימים האחרונים עדיין נמוך מהרגיל (RVOL {r['rvol']:.2f}) — "
+                   f"ההוראה עוד לא הופעלה, אין עדיין אישור קונים")
+    elif r["rvol"] >= 1.3:
+        liq.append(f"נפח הימים האחרונים כבר גבוה מהרגיל (RVOL {r['rvol']:.2f}) — "
+                   f"ייתכן שהתנועה כבר החלה")
+    if r.get("bb"):
+        liq.append(f"נגעה ברצועת בולינג׳ר {' ו'.join(r['bb'])}, אישור טכני נוסף")
+    if liq:
+        parts.append(" · ".join(liq) + ".")
+
+    extra = []
+    if r.get("above200") is True:
+        extra.append("נסחרת מעל ה-SMA200, כלומר בתוך מגמת עלייה ארוכת טווח")
+    elif r.get("above200") is False:
+        extra.append("נסחרת מתחת ל-SMA200 — נגד המגמה הארוכה, סימן אזהרה קל")
+    if r.get("rs") is not None:
+        rs_txt = "חזקה מהמדד" if r["rs"] > 0 else "חלשה מהמדד"
+        rs_abs_txt = ltr(f"{abs(r['rs']):.1f}%")
+        extra.append(f"{rs_txt} ב-{rs_abs_txt} על פני החודש האחרון (RS)")
+    if extra:
+        parts.append(" · ".join(extra) + ". שים לב: שני הגורמים האלה — מגמה וחוזק "
+                     "יחסי — לא נבדקו עדיין בבדיקה היסטורית במערכת הזאת, בניגוד "
+                     "ליובש הנפח. הם היגיון מקובל במסחר, לא הוכחה.")
+    if r.get("earn_days") is not None:
+        parts.append(f"⚠ שים לב: דוח רבעוני צפוי בעוד {r['earn_days']} ימים — "
+                     f"תוך כדי חלון ההחזקה המתוכנן. שקול לצאת לפני הדוח או להקטין גודל פוזיציה.")
+
+    waiting = r["to_entry"] > 0.3
+    wait_txt = "עדיין ממתינים לפריצה" if waiting else "קרוב מאוד להפעלה כרגע"
+    parts.append(
+        f"יחס סיכון-סיכוי ליעד הראשון: 1:{r['rr']:.1f}. נקודת הכניסה נמצאת "
+        f"{to_entry_txt} מהמחיר הנוכחי — {wait_txt}.")
+
+    if r.get("kind") == "breakdown":
+        bottom = "שורה תחתונה: תבנית טכנית הגיונית אך ניסיונית — הזדמנות משנית, לא ראשית."
+    elif r.get("tier") == "A":
+        bottom = "שורה תחתונה: אחת ההזדמנויות המבוססות ביותר שהמערכת מצאה בסריקה הזאת."
+    elif r.get("tier") == "B":
+        bottom = ("שורה תחתונה: הזדמנות סבירה — שקול גודל פוזיציה קטן יותר "
+                 "בהעדר אישוש היסטורי מלא לטווח הזה.")
+    else:
+        bottom = "שורה תחתונה: המערכת ממליצה בזהירות רבה — הנתונים רחוקים מכל מה שנבדק בעבר."
+    parts.append(bottom)
+    return " ".join(parts)
+
+
+def sparkline(vals):
+    if not vals or len(vals) < 3:
+        return ""
+    lo, hi = min(vals), max(vals)
+    rng = hi - lo if hi > lo else 1
+    n = len(vals)
+    pts = " ".join(f"{i/(n-1)*100:.2f},{(1-(v-lo)/rng)*26+2:.2f}" for i, v in enumerate(vals))
+    return (f'<div class="spark"><svg viewBox="0 0 100 30" preserveAspectRatio="none">'
+            f'<polyline points="{pts}" fill="none" stroke="#93A8B2" stroke-width="1" '
+            f'vector-effect="non-scaling-stroke"/></svg></div>')
+
+
+def ladder(r):
+    lo, hi = r["stop"], r["tp3"]
+    rng = hi - lo if hi > lo else 1
+    lv = sorted([("TP3", r["tp3"], "tp"), ("TP2", r["tp2"], "tp"), ("TP1", r["tp1"], "tp"),
+                 ("כניסה", r["entry"], "en"), ("מחיר", r["price"], "now"),
+                 ("סטופ", r["stop"], "st")], key=lambda x: -x[1])
+    used, html = [], ""
+    for tag, p, cls in lv:
+        top = 5 + (1 - (p - lo) / rng) * 156
+        for u in used:
+            if abs(top - u) < 18:
+                top = u + 18
+        used.append(top)
+        html += (f'<div class="lv {cls}" style="top:{top:.0f}px"><div class="tg">{tag}</div>'
+                 f'<div class="dt"></div><div class="px">{p:.2f}</div></div>')
+    return f'<div class="lad">{html}</div>'
+
+
+def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, total=None):
+    tier = r.get("tier") or rank_verdict(r)["tier"]
+    tcolor = r.get("tier_color") or rank_verdict(r)["color"]
+    vheadline = r.get("verdict_headline") or rank_verdict(r)["headline"]
+    rank_html = ""
+    if rank is not None:
+        rank_html = (f'<div class="rankball">{rank}'
+                    f'<span>{f"/{total}" if total else ""}</span></div>')
+    ch = "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
+    ch += f'<span class="chip">ATR {r["atr"]:.2f}$ · RVOL {r["rvol"]:.2f}</span>'
+    if r.get("rs") is not None:
+        ch += f'<span class="chip">RS {r["rs"]:+.1f}%</span>'
+    near = r["to_entry"] <= 1.0
+    badges = ""
+    if r.get("above200"):
+        badges += ('<span class="badge" style="background:rgba(74,143,176,.16);'
+                   'color:#6FB2D9">מעל SMA200</span>')
+    if r.get("rs") is not None and r["rs"] > 0:
+        badges += ('<span class="badge" style="background:rgba(47,191,143,.14);'
+                   'color:var(--lg)">חזקה מהשוק</span>')
+    if r.get("earn_days") is not None:
+        badges += ('<span class="badge" style="background:rgba(224,96,95,.16);'
+                   f'color:var(--sh)">⚠ דוח בעוד {r["earn_days"]} ימים</span>')
+    if watched:
+        badges += ('<span class="badge" style="background:rgba(212,166,75,.18);'
+                   'color:var(--gd)">★ מעקב</span>')
+    if triggered:
+        badges += ('<span class="badge" style="background:rgba(224,96,95,.16);'
+                   'color:var(--sh)">כבר הופעל</span>')
+    elif near:
+        badges += '<span class="badge">קרוב להפעלה</span>'
+    if aging:
+        badges += ('<span class="badge" style="background:rgba(212,166,75,.12);'
+                   'color:#B98C3E">מתיישנת</span>')
+    is_bd = r.get("kind") == "breakdown"
+    if is_bd:
+        badges = ('<span class="badge" style="background:rgba(138,111,176,.16);'
+                  'color:#A98FD1">שבירה ותפיסה</span>') + badges
+        head_val, head_lab = f"{r['reclaim_pct']:+.1f}%", "מעל תמיכה"
+        sub_lab = "מאז השבירה" if r.get("break_win") is None else "ימי חלון"
+        sub_val = f"{r.get('leg_bars', '—')}"
+    else:
+        head_val, head_lab = f"{r['dry']:.2f}×", "יובש נפח"
+        sub_lab, sub_val = "ימים מהשיא", str(r["age"])
+    badge_row = f'<div class="badges">{badges}</div>' if badges else ""
+    return f"""<div class="tc{' top' if best else ''}{' near' if near and not triggered else ''}">
+<div class="tc-h"><div style="display:flex;align-items:baseline;gap:.5rem">
+{rank_html}<div class="tc-s">{r['ticker']}</div>
+<span class="tierchip" style="background:{tcolor}22;color:{tcolor};border:1px solid {tcolor}55">רמה {tier}</span>
+</div><div class="tc-d"><b>{head_val}</b><span>{head_lab}</span></div></div>
+<div class="verdict-line" style="color:{tcolor}">{vheadline}</div>
+{sparkline(r.get('spark', []))}{badge_row}<div class="chips">{ch}</div>{ladder(r)}
+<div class="tl"><span>{int(r['shares'])} מניות · סיכון <b>${r['risk_total']:.0f}</b></span>
+<span>יחס <b>1:{r['rr']:.1f}</b></span></div>
+<div class="tl" style="border:0;padding-top:.22rem"><span>{sub_lab}: {sub_val}</span>
+<span>הפעלה ב-<b>{ltr(f"{r['to_entry']:+.1f}%")}</b></span></div>
+<div class="tw">{r['why']}</div></div>"""
+
+
+@st.cache_data(ttl=60, max_entries=10, show_spinner=False)
+def live(tickers):
+    """Fresh-ish quotes for the watchlist. 60-second cache."""
+    out = {}
+    if not tickers:
+        return out
+    try:
+        raw = yf.download(list(tickers), period="1mo", interval="1d", group_by="ticker",
+                          auto_adjust=False, threads=True, progress=False, timeout=12)
+    except Exception:
+        return out
+    if raw is None or len(raw) == 0:
+        return out
+    for t in tickers:
+        try:
+            d = (raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw).dropna()
+            if len(d):
+                out[t] = d
+        except Exception:
+            pass
+    return out
+
+
+def wl_encode(items):
+    return ",".join(f"{i['ticker']}:{i['entry']:.2f}:{i['stop']:.2f}:{i['tp1']:.2f}:"
+                    f"{i['tp2']:.2f}:{i['tp3']:.2f}:{int(i['shares'])}" for i in items)
+
+
+def wl_decode(txt):
+    out = []
+    for chunk in (txt or "").split(","):
+        f = chunk.split(":")
+        if len(f) == 7:
+            try:
+                out.append(dict(ticker=f[0], entry=float(f[1]), stop=float(f[2]),
+                                tp1=float(f[3]), tp2=float(f[4]), tp3=float(f[5]),
+                                shares=int(f[6])))
+            except Exception:
+                pass
+    return out
+
+
+def wl_load():
+    if "WL" not in st.session_state:
+        st.session_state["WL"] = wl_decode(st.query_params.get("w", ""))
+    return st.session_state["WL"]
+
+
+def wl_save():
+    st.query_params["w"] = wl_encode(st.session_state["WL"])
+
+
+def wl_toggle(r):
+    wl = wl_load()
+    if any(x["ticker"] == r["ticker"] for x in wl):
+        st.session_state["WL"] = [x for x in wl if x["ticker"] != r["ticker"]]
+    else:
+        st.session_state["WL"] = wl + [dict(ticker=r["ticker"], entry=r["entry"],
+                                            stop=r["stop"], tp1=r["tp1"], tp2=r["tp2"],
+                                            tp3=r["tp3"], shares=r["shares"])]
+    wl_save()
+
+
+def wl_status(item, d):
+    """Where the trade stands, using daily bars since it was saved."""
+    pct_live = 0.0
+    if d is None or len(d) == 0:
+        return dict(state="אין נתונים", cls="", px=0.0, r=0.0, pct=0.0, note="")
+    px = float(d["Close"].iloc[-1])
+    pct_live = (px / item["entry"] - 1) * 100
+    w = d.tail(15)
+    hi, lo = w["High"].values, w["Low"].values
+    risk = item["entry"] - item["stop"]
+    trig_i = next((k for k in range(len(hi)) if hi[k] >= item["entry"]), None)
+    if trig_i is None:
+        dist = (item["entry"] / px - 1) * 100
+        pct_txt = f"{dist:+.1f}%"
+        return dict(state="ממתין", cls="wait", px=px, r=0.0, pct=pct_live,
+                    note="עד ההפעלה " + ltr(pct_txt))
+    after_lo, after_hi = lo[trig_i:], hi[trig_i:]
+    if after_lo.min() <= item["stop"]:
+        return dict(state="נפגע סטופ", cls="bad", px=px, r=-1.0, pct=pct_live,
+                    note="העסקה נסגרה בהפסד")
+    if after_hi.max() >= item["tp3"]:
+        return dict(state="TP3 הושג", cls="good", px=px, pct=pct_live,
+                    r=(item["tp3"] - item["entry"]) / risk, note="העסקה מוצתה")
+    if after_hi.max() >= item["tp2"]:
+        return dict(state="TP2 הושג", cls="good", px=px, pct=pct_live,
+                    r=(px - item["entry"]) / risk, note="להזיז סטופ לכניסה")
+    if after_hi.max() >= item["tp1"]:
+        return dict(state="TP1 הושג", cls="good", px=px, pct=pct_live,
+                    r=(px - item["entry"]) / risk, note="למכור שליש, סטופ לכניסה")
+    tp1_pct = (item["tp1"] / px - 1) * 100
+    return dict(state="בפוזיציה", cls="live", px=px, pct=pct_live,
+                r=(px - item["entry"]) / risk,
+                note="עד TP1 " + ltr(f"{tp1_pct:+.1f}%"))
+
+
+def funnel_html(total, drop):
+    order = ["מחזור נמוך", "נפח מניות נמוך", "מחיר נמוך", "השיא ישן מדי", "עוד בשיא",
+             "זינוק קטן מדי", "זינוק קצר מדי", "אין מקום לזינוק", "כמעט לא תיקנה",
+             "החזירה את כל הזינוק", "הנפח לא התייבש", "רחוקה מדי מהתמיכה",
+             "אין נר בולינג׳ר", "ATR נמוך מדי", "תנודתיות נמוכה", "אין מרווח ל-TP1",
+             "היסטוריה קצרה", "אין נתוני נפח", "סטופ לא תקין", "אין ATR", "שגיאה"]
+    items = [(k, drop[k]) for k in order if drop.get(k)]
+    items += sorted([(k, v) for k, v in drop.items() if k not in order and v],
+                    key=lambda x: -x[1])
+    items.sort(key=lambda x: -x[1])
+    mx = max([v for _, v in items], default=1)
+    rows = ""
+    for idx, (k, v) in enumerate(items):
+        worst = idx == 0
+        cls = "cut worst" if worst else "cut"
+        bg = ' style="background:rgba(255,255,255,.015)"' if idx % 2 else ""
+        rows += (f'<div class="row"{bg}><div class="nm">{"⟶ " if worst else ""}{k}</div>'
+                 f'<div class="tr"><div class="fl {cls}" style="width:{v/mx*100:.1f}%"></div></div>'
+                 f'<div class="vl">{v:,}</div></div>')
+    return f'<div class="fn">{rows}</div>'
+
+
+def top_blocker(drop):
+    if not drop:
         return None
-
-    items = sorted(
-        drop_counts.items(),
-        key=lambda item: item[1],
-    )
-
-    labels = [label for label, _ in items]
-    values = [value for _, value in items]
-
-    colors = [
-        "#EF4444" if value == max(values) else "#8E4046"
-        for value in values
-    ]
-
-    figure = go.Figure(
-        go.Bar(
-            x=values,
-            y=labels,
-            orientation="h",
-            marker_color=colors,
-            text=[f"{value:,}" for value in values],
-            textposition="outside",
-            textfont={"color": "#94A3B8"},
-            hovertemplate="%{y}: %{x:,}<extra></extra>",
-        )
-    )
-
-    figure.update_layout(
-        height=max(300, 32 * len(items)),
-        margin={"l": 10, "r": 70, "t": 15, "b": 20},
-        paper_bgcolor="#121826",
-        plot_bgcolor="#121826",
-        font={"color": "#94A3B8"},
-        xaxis={"showgrid": False, "zeroline": False},
-        yaxis={"showgrid": False},
-    )
-
-    return figure
+    k, v = max(drop.items(), key=lambda x: x[1])
+    return k, v
 
 
-def backtest_equity_chart(trades: pd.DataFrame) -> go.Figure:
-    ordered = trades.sort_values("date").copy()
-    ordered["equity_r"] = ordered["R"].cumsum()
-
-    figure = go.Figure(
-        go.Scatter(
-            x=ordered["date"],
-            y=ordered["equity_r"],
-            mode="lines",
-            line={"color": "#10B981", "width": 2},
-            hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}R<extra></extra>",
-        )
-    )
-
-    figure.update_layout(
-        height=320,
-        margin={"l": 10, "r": 10, "t": 20, "b": 20},
-        paper_bgcolor="#121826",
-        plot_bgcolor="#121826",
-        font={"color": "#94A3B8"},
-        xaxis={"showgrid": False},
-        yaxis={"gridcolor": "#293348", "title": "R מצטבר"},
-    )
-
-    return figure
-
-
-def results_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame()
-
-    columns = [
-        "ticker",
-        "score",
-        "price",
-        "entry",
-        "stop",
-        "tp1",
-        "rr",
-        "to_entry_pct",
-        "atr_pct",
-        "rvol",
-        "dry",
-        "spike",
-        "dollar_volume_m",
-        "shares",
-        "risk_total",
-    ]
-
-    frame = pd.DataFrame(rows)[columns].copy()
-
-    frame.columns = [
-        "Ticker",
-        "Score",
-        "Price",
-        "Entry",
-        "Stop",
-        "Target 1",
-        "R:R",
-        "To entry %",
-        "ATR %",
-        "RVOL",
-        "Dry ratio",
-        "Volume spike",
-        "Dollar volume M",
-        "Shares",
-        "Risk $",
-    ]
-
-    return frame
+def funnel_chart(drop):
+    order = ["מחזור נמוך", "נפח מניות נמוך", "מחיר נמוך", "השיא ישן מדי", "עוד בשיא",
+             "זינוק קטן מדי", "זינוק קצר מדי", "אין מקום לזינוק", "כמעט לא תיקנה",
+             "החזירה את כל הזינוק", "הנפח לא התייבש", "רחוקה מדי מהתמיכה",
+             "אין נר בולינג׳ר", "ATR נמוך מדי", "תנודתיות נמוכה", "אין מרווח ל-TP1",
+             "היסטוריה קצרה", "אין נתוני נפח", "סטופ לא תקין", "אין ATR", "שגיאה"]
+    items = [(k, drop[k]) for k in order if drop.get(k)]
+    items += [(k, v) for k, v in drop.items() if k not in order and v]
+    items.sort(key=lambda x: x[1])  # ascending so the worst ends up on top visually
+    if not items:
+        return None
+    labels = [k for k, _ in items]
+    values = [v for _, v in items]
+    colors = ["#C13D4A" if i == len(items) - 1 else "#8E4046" for i in range(len(items))]
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation="h", marker_color=colors, marker_line_width=0,
+        text=[f"{v:,}" for v in values], textposition="outside",
+        textfont=dict(size=12, color="#A8BAC2"),
+        hovertemplate="%{y}<br>%{x:,} מניות<extra></extra>"))
+    fig.update_layout(
+        height=max(220, 30 * len(items) + 40), margin=dict(l=6, r=50, t=8, b=8),
+        paper_bgcolor="#0B1216", plot_bgcolor="#0B1216",
+        font=dict(family="Heebo, Arial, sans-serif", color="#93A8B2", size=12),
+        xaxis=dict(showgrid=True, gridcolor="#17242B", zeroline=False, side="top"),
+        yaxis=dict(showgrid=False, autorange="reversed", tickfont=dict(size=12)),
+        hoverlabel=dict(bgcolor="#131F26", bordercolor="#22333C",
+                        font=dict(family="Heebo", size=12, color="#E9EFF1")))
+    return fig
 
 
-# ============================================================
-# UI
-# ============================================================
+def stat_grid(items):
+    cells = "".join(f'<div class="{c}"><b>{v}</b><span>{lab}</span></div>'
+                    for lab, v, c in items)
+    return f'<div class="sg">{cells}</div>'
 
-now = datetime.now(ISRAEL_TZ)
 
-st.markdown(
-    f"""
-    <div class="topbar">
-        <div class="brand">
-            <div class="brand-name">MAVRI PRO</div>
-            <div class="brand-subtitle">סורק מומנטום ותבניות לפני פריצה</div>
-        </div>
-        <div>
-            <div class="clock-label">זמן ישראל</div>
-            <div class="clock-value">{now:%d/%m/%Y %H:%M}</div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+def rmap(r):
+    """Trade laid out in R multiples from stop to TP3."""
+    risk = r["entry"] - r["stop"]
+    if risk <= 0:
+        return ""
+    lo_r, hi_r = -1.0, (r["tp3"] - r["entry"]) / risk
+    span = hi_r - lo_r
+    def pos(x):
+        return (x - lo_r) / span * 100
+    e, t1 = pos(0), pos((r["tp1"] - r["entry"]) / risk)
+    t2, t3 = pos((r["tp2"] - r["entry"]) / risk), pos(hi_r)
+    h = (f'<div class="rmap"><div class="base"></div>'
+         f'<div class="risk" style="left:0;width:{e:.1f}%"></div>'
+         f'<div class="rew" style="left:{e:.1f}%;width:{t3-e:.1f}%"></div>'
+         f'<div class="mk" style="left:0"></div><div class="lb" style="left:2%">סטופ −1R</div>'
+         f'<div class="mk e" style="left:{e:.1f}%"></div>'
+         f'<div class="lb e" style="left:{e:.1f}%">כניסה</div>')
+    for x, lab in [(t1, f"TP1 +{(r['tp1']-r['entry'])/risk:.1f}R"),
+                   (t2, f"TP2 +{(r['tp2']-r['entry'])/risk:.1f}R"),
+                   (t3, f"TP3 +{hi_r:.1f}R")]:
+        h += (f'<div class="mk" style="left:{x:.1f}%"></div>'
+              f'<div class="lb" style="left:{min(x,96):.1f}%">{lab}</div>')
+    return h + "</div>"
 
-if "preset_name" not in st.session_state:
-    st.session_state["preset_name"] = "מסחר יומי מומנטום"
 
-preset_columns = st.columns([1, 1, 1, 3])
+# ---------------------------------------------------------------- top bar
 
-for column, preset_name in zip(preset_columns[:3], PRESETS):
-    if column.button(
-        preset_name,
-        use_container_width=True,
-        type=(
-            "primary"
-            if st.session_state["preset_name"] == preset_name
-            else "secondary"
-        ),
-    ):
-        st.session_state["preset_name"] = preset_name
+il = ZoneInfo("Asia/Jerusalem")
+NY = ZoneInfo("America/New_York")
+now = datetime.now(il)
+ny = datetime.now(NY)
+_mins = ny.hour * 60 + ny.minute
+_weekday = ny.weekday() < 5
+if not _weekday:
+    sess_txt, sess_cls = "סגור — סוף שבוע", "off"
+elif 4 * 60 <= _mins < 9 * 60 + 30:
+    sess_txt, sess_cls = "פרה-מרקט", "pre"
+elif 9 * 60 + 30 <= _mins < 16 * 60:
+    sess_txt, sess_cls = "פתוח", "on"
+elif 16 * 60 <= _mins < 20 * 60:
+    sess_txt, sess_cls = "אפטר-מרקט", "pre"
+else:
+    sess_txt, sess_cls = "סגור", "off"
+st.markdown(f"""<div class="bar">
+<div class="brand"><h1>MAVRI</h1><em>סורק תבניות זינוק ותיקון</em></div>
+<div class="status">
+  <div><i>שוק ניו־יורק</i><b><span class="led {sess_cls}"></span>{sess_txt}</b></div>
+  <div><i>שעה בניו־יורק</i><b>{ny:%H:%M}</b></div>
+  <div><i>שעה בישראל</i><b>{now:%H:%M}</b></div>
+  <div><i>תאריך</i><b>{now:%d.%m.%y}</b></div>
+</div></div>""", unsafe_allow_html=True)
+_ = wl_load()  # ensure state hydrated from URL before anything renders
+
+if "P" not in st.session_state:
+    st.session_state["P"] = dict(PRESETS["התבנית שלי"])
+
+p1, p2, p3, p4 = st.columns([1, 1, 1, 3])
+for col, name in zip((p1, p2, p3), PRESETS):
+    if col.button(name, use_container_width=True, key=f"ps{name}"):
+        st.session_state["P"] = dict(PRESETS[name])
+        st.rerun()
+P = st.session_state["P"]
+
+f1, f2, f3, f4, f5, f6 = st.columns([1.05, 1.15, 1, 1.15, 1, 1.35])
+dry_min = f1.number_input("יובש נפח מינ׳", 0.5, 3.0, float(P["dry"]), 0.05)
+bb_lbl = f2.selectbox("נר בולינג׳ר", ["כבוי", "רצועה תחתונה", "רצועה עליונה", "אחת מהשתיים"],
+                      index=["כבוי", "רצועה תחתונה", "רצועה עליונה",
+                             "אחת מהשתיים"].index(P["bb"]))
+min_px = f3.number_input("מחיר מינ׳ $", 1.0, 500.0, float(P["price"]), 1.0)
+min_dv = f4.number_input("מחזור מינ׳ (מ׳ $)", 1.0, 500.0, float(P["dv"]), 1.0,
+                         help="מחזור בדולרים, לא במניות. זה המדד הנכון לנזילות.")
+atr_abs = f5.number_input("ATR מינ׳ $", 0.0, 20.0, float(P["atr"]), 0.1)
+f6.markdown("<div style='height:1.55rem'></div>", unsafe_allow_html=True)
+s1, s2 = f6.columns([2, 1])
+go_ = s1.button("סרוק את השוק", type="primary", use_container_width=True)
+fresh = s2.button("↻", use_container_width=True,
+                  help="סריקה טרייה — מתעלם מהנתונים השמורים ומוריד הכל מחדש. איטי יותר.")
+if fresh:
+    fetch.clear()
+    go_ = True
+
+ptype = st.radio("סוג תבנית", ["זינוק ותיקון לתמיכה", "שבירת תמיכה ותפיסה מחדש", "שתי התבניות"],
+                 horizontal=True)
+
+with st.expander("סינון מתקדם"):
+    st.markdown("##### זינוק ותיקון")
+    g1, g2, g3, g4 = st.columns(4)
+    agev = g1.slider("ימים מהשיא", 1, 90, tuple(P["age"]))
+    retr = g2.slider("עומק תיקון %", 5, 95, tuple(P["retr"]))
+    rise_min = g3.slider("גודל זינוק מינ׳ %", 3, 100, int(P["rise"]))
+    off_max = g4.slider("מרחק מקס׳ מתמיכה %", 2, 40, int(P.get("off", 12)),
+                        help="כמה אחוז מעל התמיכה המחיר יכול להיות ועדיין להיחשב 'עליה'.")
+    h1, h2, h3, h4 = st.columns(4)
+    leg_min = h1.slider("ימי זינוק מינ׳", 3, 20, 5)
+    leg_max = h2.slider("ימי זינוק מקס׳", 8, 60, 30)
+    rr_min = h3.slider("יחס סיכון־סיכוי", 0.5, 5.0, float(P["rr"]), 0.1)
+    atr_pct = h4.slider("ATR מינ׳ %", 0.0, 10.0, float(P["atrp"]), 0.25)
+    w1, w2 = st.columns(2)
+    win = w1.slider("חלון היסטוריה (ימים)", 100, 250, 150, 10,
+                    help="רקע היסטורי לחישוב נפח בסיס. השיא עצמו נחפש רק בטווח "
+                         "'ימים מהשיא' שהגדרת למעלה — לא כאן.")
+
+    st.markdown("##### שבירת תמיכה ותפיסה מחדש")
+    n1, n2, n3, n4 = st.columns(4)
+    sup_win = n1.slider("ימים לקביעת התמיכה", 15, 90, 35)
+    break_win = n2.slider("חלון השבירה (ימים אחרונים)", 1, 10, 4)
+    break_min = n3.slider("שבירה מינ׳ %", 0.5, 15.0, 2.0, 0.5)
+    break_max = n4.slider("שבירה מקס׳ %", 3.0, 30.0, 12.0, 0.5)
+    n5, n6, n7 = st.columns(3)
+    reclaim_lo = n5.slider("תפיסה מחדש מינ׳ %", -5.0, 10.0, -1.0, 0.5,
+                           help="שלילי = עוד מתחת לתמיכה אך קרוב. חיובי = כבר מעליה.")
+    reclaim_hi = n6.slider("תפיסה מחדש מקס׳ %", 1.0, 20.0, 8.0, 0.5)
+    need_trig_b = n7.checkbox("חייב נר ירוק בתפיסה", value=True)
+
+    st.markdown("##### כללי")
+    j1, j2, j3, j4 = st.columns(4)
+    bbmode = j1.selectbox("בולינג׳ר כ־", ["בונוס", "חובה"],
+                          index=["בונוס", "חובה"].index(P.get("bbmode", "בונוס")),
+                          help="בונוס = מסומן בתווית אך לא פוסל. חובה = מסנן.")
+    bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
+    min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P["sh"]), 0.1,
+                             help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
+    limit = j4.slider("מספר מניות לסריקה", 200, 6000, 1500, 100,
+                      help="מעל 4000 לוקח משמעותית יותר זמן להוריד. "
+                           "המספר האמיתי הזמין מוצג אחרי הסריקה.")
+
+    st.markdown("##### מגמה, חוזק יחסי ודוחות — עדיין לא נבדקו בבדיקה היסטורית")
+    p1, p2, p3, p4 = st.columns(4)
+    trend_hard = p1.checkbox("דרוש מעל SMA200", value=False,
+                             help="לסחור רק תיקונים בתוך מגמת עלייה ארוכת טווח. "
+                                  "היגיון סטנדרטי במסחר, אך לא נבדק עדיין במערכת הזאת.")
+    use_rs = p2.checkbox("דרוש חוזק מול השוק", value=False,
+                         help="RS מול SPY חיובי — המנייה עלתה יותר מהמדד בחודש האחרון.")
+    rs_min_val = p3.number_input("RS מינימלי %", -20.0, 20.0, 0.0, 1.0, disabled=not use_rs)
+    earn_days = p4.number_input("הרחק מדוח (ימים)", 0, 30, 5, 1,
+                                help="0 מכבה. בודק רק את המניות שכבר עברו את שאר "
+                                     "הסינון — לא כל היקום, כדי לא להאט את הסריקה.")
+
+    q1, q2, q3 = st.columns(3)
+    rev_hard = q1.checkbox("דרוש נר היפוך איכותי", value=False,
+                           help="נר שורי עם גוף משמעותי וסגירה בחלק העליון, פטיש, "
+                                "או בליעה שורית. נר ירוק קטן לא נחשב.")
+    acct = q2.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
+    riskp = q3.slider("סיכון לעסקה %", 0.25, 5.0, 0.5, 0.25)
+
+C = dict(leg_min=leg_min, leg_max=leg_max, rise_min=rise_min, retr_lo=retr[0],
+         retr_hi=retr[1], age_lo=agev[0], age_hi=agev[1], atr_pct=atr_pct,
+         atr_abs=atr_abs, rr_min=rr_min, dry_min=dry_min, bb_look=bb_look, win=win,
+         off_max=off_max, bb_hard=(bbmode == "חובה"), trend_hard=trend_hard,
+         rev_hard=rev_hard,
+         rs_min=(rs_min_val if use_rs else None),
+         bb={"כבוי": "off", "רצועה תחתונה": "lower",
+             "רצועה עליונה": "upper", "אחת מהשתיים": "both"}[bb_lbl])
+
+CB = dict(win=win, sup_win=sup_win, break_win=break_win, break_min=break_min,
+          break_max=break_max, reclaim_lo=reclaim_lo, reclaim_hi=reclaim_hi,
+          atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min, need_trig=need_trig_b,
+          trend_hard=trend_hard, rs_min=(rs_min_val if use_rs else None))
+
+with st.expander("בדיקה היסטורית — לפני שסומכים על סינון חדש"):
+    st.markdown("בודק כל איתות היסטורי שהמסננים שלמעלה היו מזהים, ועוקב קדימה: "
+               "האם ההוראה התמלאה, והאם המחיר הגיע ליעד לפני הסטופ. משתמש **באותן** "
+               "פונקציות שהסורק החי משתמש בהן — לא חישוב נפרד.")
+    bc1, bc2, bc3 = st.columns(3)
+    bt_n = bc1.slider("כמה מניות לבדוק", 20, 500, 100, 10,
+                      help="יותר מניות = בדיקה אמינה יותר, אבל איטית יותר.")
+    bt_period = bc2.selectbox("תקופה", ["2y", "5y"], index=0)
+    bt_hold = bc3.slider("ימי החזקה מקסימלי", 5, 60, 25, 5)
+    bcc1, bcc2 = st.columns(2)
+    bt_slip = bcc1.number_input("Slippage (נקודות בסיס)", 0.0, 100.0, 5.0, 1.0,
+                                help="עלות החלקה בכניסה וביציאה. 5 נ\"ב = 0.05%.")
+    bt_comm = bcc2.number_input("עמלה למניה $", 0.0, 1.0, 0.005, 0.001, format="%.3f")
+
+    if st.button("הרץ בדיקה היסטורית", type="primary"):
+        uni_bt, _ = build_universe(bt_n)
+        spy_hist = fetch(("SPY",), period=bt_period).get("SPY")
+        spy_series = spy_return_lookup(spy_hist) if spy_hist is not None else None
+        prog_b, note_b, live_b = st.progress(0.0), st.empty(), st.empty()
+        trades, got_data, errored = [], 0, 0
+        chunks = [tuple(uni_bt[i:i + 60]) for i in range(0, len(uni_bt), 60)]
+        for ci, ch in enumerate(chunks):
+            note_b.caption(f"מנה {ci+1}/{len(chunks)} · {len(trades)} עסקאות עד כה")
+            batch = fetch(ch, period=bt_period)
+            got_data += len(batch)
+            for t, dd in batch.items():
+                try:
+                    if float(dd["Close"].iloc[-1]) < min_px:
+                        continue
+                    if float(dd["Close"].iloc[-1] * dd["Volume"].tail(20).mean()) < min_dv * 1e6:
+                        continue
+                    for tr in backtest_walk(dd, C, CB, ptype, spy_series, hold=bt_hold,
+                                            slip_bps=bt_slip, commission=bt_comm):
+                        tr["ticker"] = t
+                        trades.append(tr)
+                except Exception:
+                    errored += 1
+            prog_b.progress((ci + 1) / len(chunks))
+            if trades:
+                bb = pd.DataFrame(trades)
+                live_b.caption(f"ביניים: {len(bb)} עסקאות · "
+                              f"{(bb['R']>0).mean()*100:.1f}% הצלחה · {bb['R'].mean():+.2f}R")
+        prog_b.empty(); note_b.empty(); live_b.empty()
+        st.session_state["bt"] = trades
+        st.session_state["bt_diag"] = dict(
+            requested=len(uni_bt), got_data=got_data, errored=errored,
+            spy_ok=spy_hist is not None, when=datetime.now(il).strftime("%H:%M:%S"))
+
+    if "bt_diag" in st.session_state:
+        dg = st.session_state["bt_diag"]
+        st.caption(f"ריצה אחרונה ({dg['when']}): ביקשנו {dg['requested']} מניות · "
+                  f"קיבלנו נתונים ל-{dg['got_data']} · SPY {'הצליח' if dg['spy_ok'] else 'נכשל'} "
+                  f"· {dg['errored']} שגיאות בעיבוד.")
+        if not st.session_state.get("bt"):
+            if dg["got_data"] == 0:
+                st.error("לא התקבלו נתונים בכלל — כנראה תקלת רשת זמנית מול Yahoo Finance. "
+                        "נסה שוב בעוד רגע.")
+            else:
+                st.warning("התקבלו נתונים אבל אף עסקה לא נמצאה. עם 100 מניות ותקופה של "
+                          "שנתיים זה קורה כשהסינון מחמיר מדי — נסה: יותר מניות, תקופה "
+                          "של 5y, או הרפה זמנית את יובש הנפח / ימים מהשיא למעלה.")
+
+    if "bt" in st.session_state and st.session_state["bt"]:
+        b = pd.DataFrame(st.session_state["bt"])
+        wr = (b["R"] > 0).mean() * 100
+        avg = b["R"].mean()
+        gp = b.loc[b["R"] > 0, "R"].sum()
+        gl = -b.loc[b["R"] < 0, "R"].sum()
+        pf = gp / gl if gl > 0 else float("inf")
+        k = st.columns(5)
+        k[0].metric("עסקאות", len(b))
+        k[1].metric("אחוז הצלחה", f"{wr:.1f}%")
+        k[2].metric("תוחלת", f"{avg:+.2f}R")
+        k[3].metric("Profit factor", f"{pf:.2f}")
+        k[4].metric("סה\"כ", f"{b['R'].sum():+.0f}R")
+
+        if len(b) < 60:
+            st.warning(f"{len(b)} עסקאות בלבד — מדגם קטן מדי כדי לסמוך עליו. "
+                      "הגדל את מספר המניות או את התקופה.")
+
+        def bucket(col, bins, labels, title):
+            d2 = b.dropna(subset=[col]).copy()
+            if not len(d2):
+                st.caption(f"{title}: אין מספיק נתונים.")
+                return
+            d2["_b"] = pd.cut(d2[col], bins, labels=labels)
+            g = d2.groupby("_b", observed=True).agg(
+                עסקאות=("R", "size"),
+                אחוז_הצלחה=("R", lambda x: round((x > 0).mean() * 100, 1)),
+                תוחלת_R=("R", lambda x: round(x.mean(), 2))).reset_index()
+            g.columns = [title, "עסקאות", "אחוז הצלחה", "תוחלת R"]
+            st.dataframe(g, hide_index=True, use_container_width=True)
+
+        st.markdown("##### יובש נפח — בדיקת אימות חוזרת")
+        bucket("dry", [0, 1.1, 1.3, 1.6, 2.2, 99],
+              ["<1.1", "1.1-1.3", "1.3-1.6", "1.6-2.2", "2.2+"], "יובש נפח")
+
+        st.markdown("##### חוזק מול השוק (RS) — גורם חדש, לא נבדק לפני כן")
+        bucket("rs", [-100, 0, 100], ["שלילי (חלשה מהשוק)", "חיובי (חזקה מהשוק)"], "RS")
+
+        st.markdown("##### מגמת יסוד (SMA200) — גורם חדש, לא נבדק לפני כן")
+        b["trend_txt"] = b["above200"].map({True: "מעל SMA200", False: "מתחת ל-SMA200"})
+        d3 = b.dropna(subset=["trend_txt"])
+        if len(d3):
+            g3 = d3.groupby("trend_txt").agg(
+                עסקאות=("R", "size"),
+                אחוז_הצלחה=("R", lambda x: round((x > 0).mean() * 100, 1)),
+                תוחלת_R=("R", lambda x: round(x.mean(), 2))).reset_index()
+            g3.columns = ["מגמה", "עסקאות", "אחוז הצלחה", "תוחלת R"]
+            st.dataframe(g3, hide_index=True, use_container_width=True)
+        else:
+            st.caption("אין מספיק נתונים.")
+
+        st.caption("אם קטגוריה מסוימת מראה תוחלת גבוהה יותר באופן עקבי — שווה להפוך "
+                  "אותה לסינון קבוע. אם ההבדלים קטנים או לא עקביים, זה כנראה רעש. "
+                  "דוחות רבעוניים לא ניתנים לבדיקה כאן — אין לנו נתוני דוחות עבר אמינים בחינם.")
+        st.download_button("הורד את כל העסקאות (CSV)", b.to_csv(index=False),
+                          f"backtest_{datetime.now():%Y%m%d_%H%M}.csv", "text/csv")
+
+# ---------------------------------------------------------------- detail
+
+def render_watchlist():
+    wl = wl_load()
+    if not wl:
+        return
+    st.markdown("### רשימת מעקב")
+    tickers = tuple(x["ticker"] for x in wl)
+    data = live(tickers)
+    active, closed = [], []
+    for item in wl:
+        st_ = wl_status(item, data.get(item["ticker"]))
+        (closed if st_["state"] in ("נפגע סטופ", "TP3 הושג") else active).append((item, st_))
+
+    for item, st_ in active:
+        r_cls = "z" if abs(st_["r"]) < .05 else ("p" if st_["r"] > 0 else "n")
+        pct_cls = "z" if abs(st_["pct"]) < .05 else ("p" if st_["pct"] > 0 else "n")
+        st.markdown(f"""<div class="wl-row {st_['cls']}">
+<div class="wl-sym">{item['ticker']}</div>
+<div class="wl-st {st_['cls']}">{st_['state']}</div>
+<div class="wl-px">${st_['px']:.2f}</div>
+<div class="wl-r {pct_cls}">{ltr(f"{st_['pct']:+.1f}%")}<span style="color:var(--dm);font-size:.62rem"> מהכניסה</span></div>
+<div class="wl-r {r_cls}">{ltr(f"{st_['r']:+.2f}R")}</div>
+<div class="wl-note">{st_['note']}</div>
+</div>""", unsafe_allow_html=True)
+        b1, b2 = st.columns([1, 6])
+        if b1.button("פתח", key=f"wlopen_{item['ticker']}"):
+            st.session_state["open"] = item["ticker"]
+            st.rerun()
+
+    if closed:
+        with st.expander(f"נסגרו ({len(closed)})"):
+            for item, st_ in closed:
+                r_cls = "p" if st_["r"] > 0 else "n"
+                st.markdown(f"""<div class="wl-row {st_['cls']}">
+<div class="wl-sym">{item['ticker']}</div>
+<div class="wl-st {st_['cls']}">{st_['state']}</div>
+<div class="wl-px">${st_['px']:.2f}</div>
+<div class="wl-r {r_cls}">{ltr(f"{st_['r']:+.2f}R")}</div>
+<div class="wl-note">{st_['note']}</div></div>""", unsafe_allow_html=True)
+            if st.button("נקה עסקאות שנסגרו"):
+                keep = {i["ticker"] for i, s_ in active}
+                st.session_state["WL"] = [x for x in wl if x["ticker"] in keep]
+                wl_save()
+                st.rerun()
+    st.markdown("---")
+
+
+try:
+    render_watchlist()
+except Exception:
+    st.warning("לא הצלחתי לטעון את רשימת המעקב כרגע (כנראה תקלת רשת זמנית). "
+               "שאר המערכת עובדת כרגיל.")
+
+if st.session_state.get("open"):
+    r = next((x for x in st.session_state.get("rows", [])
+              if x["ticker"] == st.session_state["open"]), None)
+    if r is None:
+        st.session_state["open"] = None
         st.rerun()
 
-base_cfg = PRESETS[st.session_state["preset_name"]]
-
-control_1, control_2, control_3, control_4, control_5, control_6 = st.columns(
-    [1, 1, 1, 1.2, 1, 1.5]
-)
-
-dry_min = control_1.number_input(
-    "יחס יובש מינימלי",
-    min_value=0.5,
-    max_value=5.0,
-    value=float(base_cfg.dry_ratio_min),
-    step=0.05,
-)
-
-spike_min = control_2.number_input(
-    "קפיצת נפח מינימלית",
-    min_value=0.5,
-    max_value=10.0,
-    value=float(base_cfg.spike_ratio_min),
-    step=0.1,
-)
-
-min_price = control_3.number_input(
-    "מחיר מינימום $",
-    min_value=1.0,
-    max_value=500.0,
-    value=float(base_cfg.min_price),
-    step=1.0,
-)
-
-min_dollar_volume = control_4.number_input(
-    "מחזור דולרי ממוצע, מיליון",
-    min_value=1.0,
-    max_value=1000.0,
-    value=float(base_cfg.min_dollar_volume_m),
-    step=1.0,
-)
-
-min_atr_pct = control_5.number_input(
-    "ATR מינימלי %",
-    min_value=0.1,
-    max_value=20.0,
-    value=float(base_cfg.atr_min_pct),
-    step=0.1,
-)
-
-control_6.markdown(
-    "<div style='height:1.75rem'></div>",
-    unsafe_allow_html=True,
-)
-
-scan_clicked = control_6.button(
-    "🚀 סרוק את השוק",
-    type="primary",
-    use_container_width=True,
-)
-
-with st.expander("⚙️ הגדרות מתקדמות"):
-    row_1 = st.columns(4)
-
-    min_share_volume = row_1[0].number_input(
-        "נפח מניות ממוצע, מיליון",
-        min_value=0.0,
-        max_value=100.0,
-        value=float(base_cfg.min_share_volume_m),
-        step=0.25,
-    )
-
-    scan_limit = row_1[1].slider(
-        "מספר סימולים לסריקה",
-        min_value=500,
-        max_value=6000,
-        value=DEFAULT_SCAN_SIZE,
-        step=250,
-    )
-
-    account_size = row_1[2].number_input(
-        "גודל תיק $",
-        min_value=500.0,
-        max_value=10_000_000.0,
-        value=25_000.0,
-        step=500.0,
-    )
-
-    risk_percent = row_1[3].slider(
-        "סיכון לעסקה %",
-        min_value=0.1,
-        max_value=3.0,
-        value=0.5,
-        step=0.1,
-    )
-
-    row_2 = st.columns(4)
-
-    rise_min = row_2[0].number_input(
-        "זינוק מינימלי %",
-        min_value=1.0,
-        max_value=200.0,
-        value=float(base_cfg.rise_min_pct),
-        step=1.0,
-    )
-
-    leg_bars_min = row_2[1].number_input(
-        "מינימום נרות ברגל העלייה",
-        min_value=1,
-        max_value=30,
-        value=int(base_cfg.leg_bars_min),
-        step=1,
-    )
-
-    retrace_range = row_2[2].slider(
-        "טווח תיקון %",
-        min_value=0,
-        max_value=100,
-        value=(
-            int(base_cfg.retrace_min_pct),
-            int(base_cfg.retrace_max_pct),
-        ),
-        step=1,
-    )
-
-    rr_min = row_2[3].number_input(
-        "יחס סיכוי-סיכון מינימלי",
-        min_value=0.5,
-        max_value=10.0,
-        value=float(base_cfg.rr_min),
-        step=0.1,
-    )
-
-    row_3 = st.columns(4)
-
-    reversal_required = row_3[0].checkbox(
-        "נר היפוך חובה",
-        value=base_cfg.reversal_required,
-    )
-
-    bb_label = row_3[1].selectbox(
-        "פילטר בולינגר",
-        options=["כבוי", "תחתונה", "עליונה", "אחת מהשתיים"],
-        index=0,
-    )
-
-    bb_required = row_3[2].checkbox(
-        "מגע בולינגר חובה",
-        value=base_cfg.bb_required,
-    )
-
-    support_distance = row_3[3].number_input(
-        "מרחק מקסימלי מתמיכה %",
-        min_value=1.0,
-        max_value=50.0,
-        value=float(base_cfg.support_distance_max_pct),
-        step=1.0,
-    )
-
-bb_mapping = {
-    "כבוי": "off",
-    "תחתונה": "lower",
-    "עליונה": "upper",
-    "אחת מהשתיים": "both",
-}
-
-cfg = replace(
-    base_cfg,
-    min_price=float(min_price),
-    min_dollar_volume_m=float(min_dollar_volume),
-    min_share_volume_m=float(min_share_volume),
-    dry_ratio_min=float(dry_min),
-    spike_ratio_min=float(spike_min),
-    atr_min_pct=float(min_atr_pct),
-    rise_min_pct=float(rise_min),
-    leg_bars_min=int(leg_bars_min),
-    retrace_min_pct=float(retrace_range[0]),
-    retrace_max_pct=float(retrace_range[1]),
-    rr_min=float(rr_min),
-    reversal_required=bool(reversal_required),
-    bb_side=bb_mapping[bb_label],
-    bb_required=bool(bb_required),
-    support_distance_max_pct=float(support_distance),
-)
-
-st.markdown(
-    """
-    <div class="notice">
-        <strong>חשוב:</strong>
-        הסריקה משתמשת בנרות יומיים ולכן מאתרת תבניות וטריגרים אפשריים.
-        למסחר יומי בזמן אמת יש לאשר מחיר, נפח, Spread וחדשות באמצעות מקור נתונים תוך-יומי אמין.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# BACKTEST UI
-# ============================================================
-
-with st.expander("📊 בדיקה היסטורית שמרנית"):
-    st.write(
-        "הבדיקה כוללת נזילות היסטורית, יציאת זמן, Slippage, "
-        "עמלה והנחה שמרנית כאשר יעד וסטופ נפגעים באותו נר."
-    )
-
-    bt_1, bt_2, bt_3, bt_4 = st.columns(4)
-
-    backtest_symbols = bt_1.slider(
-        "כמות סימולים לבדיקה",
-        min_value=50,
-        max_value=1000,
-        value=250,
-        step=50,
-    )
-
-    max_hold_days = bt_2.slider(
-        "מקסימום ימי החזקה",
-        min_value=1,
-        max_value=30,
-        value=10,
-        step=1,
-    )
-
-    slippage_bps = bt_3.number_input(
-        "Slippage, נקודות בסיס",
-        min_value=0.0,
-        max_value=100.0,
-        value=5.0,
-        step=1.0,
-    )
-
-    commission_per_share = bt_4.number_input(
-        "עמלה למניה $",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.005,
-        step=0.001,
-        format="%.3f",
-    )
-
-    run_backtest = st.button(
-        "הרץ Backtest",
-        type="secondary",
-        use_container_width=True,
-    )
-
-    if run_backtest:
-        try:
-            universe = build_universe(backtest_symbols)
-            batches = list(chunked(universe, BATCH_SIZE))
-            progress = st.progress(0.0)
-            status = st.empty()
-            trades: list[dict[str, Any]] = []
-
-            for batch_index, batch in enumerate(batches):
-                status.caption(
-                    f"בדיקה היסטורית: מנה {batch_index + 1} "
-                    f"מתוך {len(batches)}"
-                )
-
-                data = fetch_batch(batch, period="5y")
-
-                for ticker, frame in data.items():
-                    try:
-                        trades.extend(
-                            backtest_symbol(
-                                ticker=ticker,
-                                frame=frame,
-                                cfg=cfg,
-                                max_hold_days=int(max_hold_days),
-                                cooldown_days=5,
-                                slippage_bps=float(slippage_bps),
-                                commission_per_share=float(
-                                    commission_per_share
-                                ),
-                            )
-                        )
-                    except Exception:
-                        continue
-
-                progress.progress((batch_index + 1) / len(batches))
-
-            progress.empty()
-            status.empty()
-
-            if not trades:
-                st.warning(
-                    "לא נמצאו עסקאות. ייתכן שהסינון מחמיר מדי "
-                    "או שלא התקבל מספיק מידע היסטורי."
-                )
-            else:
-                bt_frame = pd.DataFrame(trades)
-                bt_frame = bt_frame.sort_values("date")
-                summary = summarize_backtest(bt_frame)
-
-                kpi_columns = st.columns(6)
-                kpi_columns[0].metric(
-                    "עסקאות",
-                    f"{int(summary['trades']):,}",
-                )
-                kpi_columns[1].metric(
-                    "אחוז הצלחה",
-                    f"{summary['win_rate']:.1f}%",
-                )
-                kpi_columns[2].metric(
-                    "תוחלת",
-                    f"{summary['expectancy']:+.2f}R",
-                )
-                kpi_columns[3].metric(
-                    "Profit Factor",
-                    (
-                        f"{summary['profit_factor']:.2f}"
-                        if np.isfinite(summary["profit_factor"])
-                        else "∞"
-                    ),
-                )
-                kpi_columns[4].metric(
-                    "Max Drawdown",
-                    f"{summary['max_drawdown_r']:.1f}R",
-                )
-                kpi_columns[5].metric(
-                    "זמן החזקה ממוצע",
-                    f"{summary['avg_hold']:.1f} ימים",
-                )
-
-                st.plotly_chart(
-                    backtest_equity_chart(bt_frame),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                )
-
-                outcome_counts = (
-                    bt_frame["outcome"]
-                    .value_counts()
-                    .rename_axis("Outcome")
-                    .reset_index(name="Trades")
-                )
-
-                st.dataframe(
-                    outcome_counts,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-        except Exception as exc:
-            st.error(f"שגיאה בבדיקה ההיסטורית: {exc}")
-
-
-# ============================================================
-# MARKET SCAN
-# ============================================================
-
-if scan_clicked:
-    started = time.perf_counter()
-
-    try:
-        universe = build_universe(int(scan_limit))
-    except Exception as exc:
-        st.error(f"לא ניתן לבנות את רשימת הסימולים: {exc}")
-        st.stop()
-
-    batches = list(chunked(universe, BATCH_SIZE))
-    progress = st.progress(0.0)
-    status = st.empty()
-
-    rows: list[dict[str, Any]] = []
-    drops: Counter[str] = Counter()
-    downloaded_count = 0
-    technical_errors = 0
-
-    for batch_index, batch in enumerate(batches):
-        status.caption(
-            f"סורק מנה {batch_index + 1} מתוך {len(batches)} | "
-            f"נבדקו {downloaded_count:,} | נמצאו {len(rows):,}"
-        )
-
-        batch_data = fetch_batch(batch, period="1y")
-        missing = len(batch) - len(batch_data)
-
-        if missing > 0:
-            drops["לא התקבלו נתונים"] += missing
-
-        for ticker, frame in batch_data.items():
-            downloaded_count += 1
-
-            try:
-                prepared = prepare_frame(frame)
-                result, reason = evaluate_setup(
-                    prepared,
-                    len(prepared) - 1,
-                    cfg,
-                )
-
-                if result is None:
-                    drops[reason] += 1
-                    continue
-
-                risk_budget = account_size * risk_percent / 100
-                risk_per_share = float(result["risk_share"])
-
-                risk_based_shares = (
-                    math.floor(risk_budget / risk_per_share)
-                    if risk_per_share > 0
-                    else 0
-                )
-
-                # Prevent position value from exceeding the account.
-                cash_based_shares = math.floor(
-                    account_size / float(result["entry"])
-                )
-
-                shares = max(
-                    0,
-                    min(risk_based_shares, cash_based_shares),
-                )
-
-                result.update(
-                    ticker=ticker,
-                    shares=shares,
-                    risk_total=round(
-                        shares * risk_per_share,
-                        2,
-                    ),
-                )
-
-                rows.append(result)
-
-            except Exception:
-                technical_errors += 1
-                drops["שגיאת נתונים"] += 1
-
-        progress.progress((batch_index + 1) / len(batches))
-
-    progress.empty()
-    status.empty()
-
-    rows.sort(
-        key=lambda row: (
-            -row["score"],
-            row["to_entry_pct"],
-            -row["dollar_volume_m"],
-        )
-    )
-
-    elapsed = time.perf_counter() - started
-
-    st.session_state["scan_result"] = {
-        "rows": rows[:MAX_RESULTS],
-        "universe_count": len(universe),
-        "downloaded_count": downloaded_count,
-        "drops": dict(drops),
-        "elapsed": elapsed,
-        "technical_errors": technical_errors,
-        "scanned_at": datetime.now(ISRAEL_TZ).isoformat(),
+    nav1, nav2, nav3 = st.columns([1, 3.4, 1])
+    if nav1.button("→  חזרה לרשימה", use_container_width=True):
+        st.session_state["open"] = None
+        st.rerun()
+    others = [x["ticker"] for x in st.session_state["rows"]]
+    jump = nav2.selectbox("מעבר מהיר", others, index=others.index(r["ticker"]),
+                          label_visibility="collapsed")
+    if jump != r["ticker"]:
+        st.session_state["open"] = jump
+        st.rerun()
+    in_wl = r["ticker"] in {x["ticker"] for x in wl_load()}
+    if nav3.button("★ במעקב" if in_wl else "☆ הוסף למעקב", use_container_width=True):
+        wl_toggle(r)
+        st.rerun()
+
+    v_ = rank_verdict(r)
+    rank_disp = r.get("_rank")
+    total_disp = len(st.session_state.get("rows", []))
+    rank_tag = f'דירוג #{rank_disp} מתוך {total_disp} · ' if rank_disp else ""
+    st.markdown(f"""<div style="direction:rtl;display:flex;align-items:center;gap:.9rem;
+    margin:.8rem 0 1rem;padding:.85rem 1rem;background:var(--pan);border:1px solid var(--ln);
+    border-right:4px solid {v_['color']};border-radius:5px">
+    <div style="font-family:'Frank Ruhl Libre',serif;font-size:1.9rem;font-weight:700;
+    color:{v_['color']}">{r['ticker']}</div>
+    <div style="width:1px;align-self:stretch;background:var(--ln)"></div>
+    <div style="flex:1">
+      <div style="font-size:.95rem;color:{v_['color']};font-weight:500">{rank_tag}רמה {v_['tier']} — {v_['headline']}</div>
+      <div style="font-size:.8rem;color:var(--dm);margin-top:.15rem">{r['why']}</div>
+    </div></div>""", unsafe_allow_html=True)
+    with st.expander("הסבר AI מלא על ההמלצה", expanded=True):
+        full_txt = explain_ai(r, rank=rank_disp, total=total_disp)
+        st.markdown(f'<div class="tw" style="font-size:.86rem;line-height:1.9">{full_txt}</div>',
+                   unsafe_allow_html=True)
+
+    INTERVALS = {
+        "יומי": ("1d", {"3 חודשים": "3mo", "6 חודשים": "6mo", "שנה": "1y", "שנתיים": "2y"}),
+        "שבועי": ("1wk", {"שנה": "1y", "שנתיים": "2y", "5 שנים": "5y", "10 שנים": "10y"}),
+        "שעתי": ("60m", {"5 ימים": "5d", "חודש": "1mo", "3 חודשים": "3mo", "6 חודשים": "6mo"}),
+        "30 דקות": ("30m", {"5 ימים": "5d", "10 ימים": "10d", "חודש": "1mo"}),
+        "15 דקות": ("15m", {"3 ימים": "3d", "5 ימים": "5d", "10 ימים": "10d"}),
+        "5 דקות": ("5m", {"יום": "1d", "3 ימים": "3d", "5 ימים": "5d"}),
     }
 
+    cc1, cc2, cc3, cc4 = st.columns([1, 1, 2.2, 1])
+    tf = cc1.selectbox("נרות", list(INTERVALS), index=0)
+    iv, ranges = INTERVALS[tf]
+    per = cc2.selectbox("טווח", list(ranges), index=min(1, len(ranges) - 1))
+    ind = cc3.multiselect("שכבות", ["בולינג׳ר", "SMA20", "SMA50", "SMA200", "VWAP",
+                                    "רמות עסקה", "אזורי תבנית"],
+                          default=["בולינג׳ר", "SMA20", "SMA50", "רמות עסקה", "אזורי תבנית"])
+    show_rsi = cc4.checkbox("RSI", value=True)
 
-# ============================================================
-# RESULTS
-# ============================================================
+    v = get_chart_data(r, per, iv, ranges)
+    if v is None:
+        st.error(f"לא הצלחתי להוריד נתונים ל-{r['ticker']} בטווח הזה. "
+                 "אינטרוול תוך-יומי מוגבל בהיסטוריה — נסה טווח קצר יותר, או נרות יומיים.")
+        if st.button("נסה שוב"):
+            fetch_one.clear()
+            st.rerun()
+    else:
+        # ---- categorical x-axis: real trading bars only, no timezone-dependent
+        # rangebreaks, no dead space. Every pixel of width is real data. ----
+        n = len(v)
+        xs = list(range(n))
+        if iv == "1d":
+            dtxt = [d.strftime("%d.%m.%y") for d in v.index]
+        elif iv == "1wk":
+            dtxt = [d.strftime("שבוע %d.%m.%y") for d in v.index]
+        else:
+            dtxt = [d.strftime("%d.%m  %H:%M") for d in v.index]
 
-scan_result = st.session_state.get("scan_result")
+        n_ticks = min(8, n)
+        tick_idx = sorted(set(int(k) for k in np.linspace(0, n - 1, n_ticks)))
+        tick_txt = [dtxt[k] for k in tick_idx]
 
-if scan_result:
-    rows = scan_result["rows"]
-    drops = Counter(scan_result["drops"])
+        rows_n = 3 if show_rsi else 2
+        heights = [.62, .19, .19] if show_rsi else [.78, .22]
+        fig = make_subplots(rows=rows_n, cols=1, shared_xaxes=True,
+                            row_heights=heights, vertical_spacing=.02)
 
-    top_score = rows[0]["score"] if rows else 0.0
+        if "בולינג׳ר" in ind and n > 20:
+            mid, sd = v["Close"].rolling(20).mean(), v["Close"].rolling(20).std()
+            fig.add_trace(go.Scatter(x=xs, y=mid + 2 * sd, line=dict(color="#33505E", width=1.1),
+                                     name="BB עליון", hoverinfo="skip"), 1, 1)
+            fig.add_trace(go.Scatter(x=xs, y=mid - 2 * sd, line=dict(color="#33505E", width=1.1),
+                                     fill="tonexty", fillcolor="rgba(51,80,94,.14)",
+                                     name="BB תחתון", hoverinfo="skip"), 1, 1)
 
-    st.markdown(
-        f"""
-        <div class="kpis">
-            <div class="kpi">
-                <strong>{scan_result['universe_count']:,}</strong>
-                <span>סימולים ביקום</span>
-            </div>
-            <div class="kpi">
-                <strong>{scan_result['downloaded_count']:,}</strong>
-                <span>התקבלו נתונים</span>
-            </div>
-            <div class="kpi good">
-                <strong>{len(rows):,}</strong>
-                <span>תבניות שנמצאו</span>
-            </div>
-            <div class="kpi">
-                <strong>{top_score:.1f}</strong>
-                <span>הציון הגבוה ביותר</span>
-            </div>
-            <div class="kpi">
-                <strong>{scan_result['elapsed']:.1f}s</strong>
-                <span>זמן סריקה</span>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        fig.add_trace(go.Candlestick(
+            x=xs, open=v.Open, high=v.High, low=v.Low, close=v.Close,
+            name=r["ticker"], text=dtxt, hovertext=dtxt,
+            increasing_line_color="#2FBF8F", decreasing_line_color="#E0605F",
+            increasing_fillcolor="#2FBF8F", decreasing_fillcolor="#E0605F",
+            increasing_line_width=1.4, decreasing_line_width=1.4,
+            hovertemplate="%{text}<br>O %{open:.2f}  H %{high:.2f}<br>"
+                          "L %{low:.2f}  C %{close:.2f}<extra></extra>"), 1, 1)
 
-    if drops:
-        top_reason, top_count = drops.most_common(1)[0]
+        for nm, per_, col in [("SMA20", 20, "#4E8FB0"), ("SMA50", 50, "#D4A64B"),
+                              ("SMA200", 200, "#8A6FB0")]:
+            if nm in ind and n > per_:
+                fig.add_trace(go.Scatter(x=xs, y=v["Close"].rolling(per_).mean(),
+                                         line=dict(color=col, width=1.6), name=nm), 1, 1)
+        if "VWAP" in ind:
+            tp = (v["High"] + v["Low"] + v["Close"]) / 3
+            vw = (tp * v["Volume"]).cumsum() / v["Volume"].cumsum().replace(0, np.nan)
+            fig.add_trace(go.Scatter(x=xs, y=vw, line=dict(color="#C77DBA", width=1.4,
+                                                            dash="dot"), name="VWAP"), 1, 1)
+        if "אזורי תבנית" in ind and iv == "1d" and r["age"] + r["leg_bars"] < n:
+            lg_x, pk_x = n - 1 - r["age"] - r["leg_bars"], n - 1 - r["age"]
+            fig.add_vrect(x0=lg_x, x1=pk_x, fillcolor="#2FBF8F", opacity=.08,
+                          line_width=0, row=1, col=1)
+            fig.add_vrect(x0=pk_x, x1=n - 1, fillcolor="#E0605F", opacity=.08,
+                          line_width=0, row=1, col=1)
+        if "רמות עסקה" in ind:
+            lvl_list = [(r["entry"], "כניסה", "#D4A64B", "solid"),
+                       (r["stop"], "סטופ", "#E0605F", "dash"),
+                       (r.get("support", r["stop"]), "תמיכה", "#6C8896", "dot"),
+                       (r["tp1"], "TP1", "#2FBF8F", "dot"),
+                       (r["tp2"], "TP2", "#2FBF8F", "dot"),
+                       (r["tp3"], "TP3", "#2FBF8F", "dot")]
+            if r.get("kind") == "breakdown":
+                lvl_list.append((r.get("resistance", r["tp3"]), "התנגדות", "#8A6FB0", "dot"))
+            for y_, lab, col, dash in lvl_list:
+                fig.add_hline(y=y_, line_dash=dash, line_color=col, line_width=1.2,
+                              annotation_text=f"{lab}  {y_:.2f}", annotation_position="right",
+                              annotation_font_size=12, annotation_font_color=col, row=1, col=1)
 
-        st.markdown(
-            f"""
-            <div class="notice">
-                המסנן שהוציא הכי הרבה סימולים:
-                <strong>{escape(top_reason)}</strong>
-                ({top_count:,}).
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        vc = ["#2FBF8F" if x >= y2 else "#E0605F" for x, y2 in zip(v.Close, v.Open)]
+        fig.add_trace(go.Bar(x=xs, y=v.Volume, marker_color=vc, marker_line_width=0,
+                             opacity=.55, name="נפח", hovertext=dtxt,
+                             hovertemplate="%{hovertext}<br>נפח %{y:,.0f}<extra></extra>",
+                             showlegend=False), 2, 1)
+        if n > 20:
+            fig.add_trace(go.Scatter(x=xs, y=v["Volume"].rolling(20).mean(),
+                                     line=dict(color="#93A8B2", width=1.2), showlegend=False,
+                                     hoverinfo="skip"), 2, 1)
 
-    with st.expander("🔻 מפל הסינון"):
-        figure = funnel_chart(drops)
+        if show_rsi and n > 15:
+            dl = v["Close"].diff()
+            up = dl.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+            dn = (-dl.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+            fig.add_trace(go.Scatter(x=xs, y=100 - 100 / (1 + up / dn.replace(0, np.nan)),
+                                     line=dict(color="#D4A64B", width=1.5), name="RSI",
+                                     hovertext=dtxt, hovertemplate="%{hovertext}<br>RSI %{y:.1f}"
+                                                                    "<extra></extra>",
+                                     showlegend=False), 3, 1)
+            for lvl, cl in [(70, "#E0605F"), (30, "#2FBF8F"), (50, "#2A3D47")]:
+                fig.add_hline(y=lvl, line_color=cl, line_width=.9, line_dash="dot", row=3, col=1)
+            fig.update_yaxes(range=[0, 100], row=3, col=1)
 
-        if figure is not None:
-            st.plotly_chart(
-                figure,
-                use_container_width=True,
-                config={"displayModeBar": False},
-            )
+        fig.update_layout(
+            height=700 if show_rsi else 580, xaxis_rangeslider_visible=False,
+            font=dict(family="Heebo, Arial, sans-serif", color="#A8BAC2", size=13),
+            hovermode="x unified", dragmode="pan",
+            paper_bgcolor="#0B1216", plot_bgcolor="#0B1216",
+            legend=dict(orientation="h", y=1.045, x=0, bgcolor="rgba(0,0,0,0)",
+                        font=dict(size=11)),
+            margin=dict(l=6, r=118, t=30, b=6),
+            hoverlabel=dict(bgcolor="#131F26", bordercolor="#22333C",
+                            font=dict(family="Heebo", size=12, color="#E9EFF1")))
+        fig.update_xaxes(showgrid=False, linecolor="#22333C", zeroline=False,
+                         tickmode="array", tickvals=tick_idx, ticktext=tick_txt,
+                         tickfont=dict(size=11))
+        fig.update_xaxes(tickmode="array", tickvals=tick_idx, ticktext=tick_txt,
+                         row=rows_n, col=1)
+        fig.update_yaxes(gridcolor="#17242B", zeroline=False, linecolor="#22333C",
+                         tickfont=dict(size=11), side="right")
+        fig.update_xaxes(range=[-1, n], row=1, col=1)
+        fig.add_annotation(text="MAVRI", x=0.01, y=0.06, xref="paper", yref="paper",
+                          showarrow=False, font=dict(size=22, color="rgba(147,168,178,.07)",
+                                                     family="Frank Ruhl Libre"))
+
+        st.plotly_chart(fig, use_container_width=True, config={
+            "scrollZoom": True, "displaylogo": False,
+            "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"],
+            "displayModeBar": True, "responsive": True, "doubleClick": "reset",
+            "toImageButtonOptions": {"scale": 2}})
+        st.caption("גלגלת העכבר מקרבת ומרחיקה · גרירה מזיזה · לחיצה כפולה מאפסת · "
+                   "בנייד צביטה בשתי אצבעות. הנתונים כוללים ימי מסחר בלבד — "
+                   "ללא רווחים מלאכותיים בין ימים.")
+
+    st.markdown("### תוכנית מסחר — עד 4 ימים")
+    dtp = day_trade_plan(r)
+    dt_shares = int((acct * riskp / 100) / dtp["risk"]) if dtp["risk"] > 0 else 0
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("כניסה", f"${dtp['entry']:.2f}")
+    m2.metric("סטופ", f"${dtp['stop']:.2f}", f"-${dtp['risk']:.2f}/מניה", delta_color="off")
+    m3.metric("יעד ראשון", f"${dtp['t1']:.2f}", f"1:{dtp['rr1']:.1f}")
+    m4.metric("כמות מניות", f"{dt_shares:,}", f"סיכון ${round(dt_shares*dtp['risk']):,}",
+              delta_color="off")
+    st.markdown(f"""<div class="tw" style="font-size:.83rem;line-height:1.9">
+<b style="color:var(--tx)">יום 1</b> — ממתינים להפעלה: פריצה מעל {ltr(f"${dtp['entry']:.2f}")} בנפח מוגבר. לא הופעל? לא נוגעים.<br>
+<b style="color:var(--tx)">יום 1–2</b> — לאחר הפעלה, סטופ קבוע ב-{ltr(f"${dtp['stop']:.2f}")}. הגעה ל-{ltr(f"${dtp['t1']:.2f}")} (T1) → מוכרים שליש, מעלים סטופ לכניסה.<br>
+<b style="color:var(--tx)">יום 2–3</b> — הגעה ל-{ltr(f"${dtp['t2']:.2f}")} (T2) → מוכרים שליש נוסף, סטופ עוקב מתחת לשפל היום הקודם.<br>
+<b style="color:var(--tx)">יום 3–4</b> — יתרה ל-{ltr(f"${dtp['t3']:.2f}")} (T3) או יציאה ידנית.
+<span style="color:var(--sh)">לא הופעל תוך 4 ימי מסחר → מבטלים, התבנית התיישנה.</span>
+</div>""", unsafe_allow_html=True)
+    st.code(f"{r['ticker']}\n"
+            f"BUY STOP {dt_shares} @ {dtp['entry']:.2f}\n"
+            f"STOP {dtp['stop']:.2f}\n"
+            f"T1 {dtp['t1']:.2f}  ·  T2 {dtp['t2']:.2f}  ·  T3 {dtp['t3']:.2f}\n"
+            f"בטל אם לא הופעל תוך 4 ימי מסחר", language=None)
+
+    with st.expander("תוכנית סווינג מלאה — למי שרוצה להחזיק מעבר ל-4 ימים"):
+        st.markdown(rmap(r), unsafe_allow_html=True)
+        q1, q2 = st.columns(2)
+        with q1:
+            st.code(f"{r['ticker']}\n"
+                    f"BUY STOP {int(r['shares'])} @ {r['entry']:.2f}\n"
+                    f"STOP {r['stop']:.2f}\n"
+                    f"TP1 {r['tp1']:.2f}  ·  TP2 {r['tp2']:.2f}  ·  TP3 {r['tp3']:.2f}",
+                    language=None)
+        with q2:
+            st.markdown(stat_grid([
+                ("כמות מניות", f"{int(r['shares']):,}", ""),
+                ("שווי פוזיציה", f"${r['shares']*r['entry']:,.0f}", ""),
+                ("סיכון", f"${r['risk_total']:,.0f}", "dn"),
+                ("רווח ב-TP1", f"${r['shares']*(r['tp1']-r['entry']):,.0f}", "up"),
+                ("רווח ב-TP3", f"${r['shares']*(r['tp3']-r['entry']):,.0f}", "up"),
+            ]), unsafe_allow_html=True)
+        st.caption("שתי התוכניות משתמשות באותה נקודת כניסה. ההבדל הוא מרחק הסטופ "
+                   "והיעדים — התוכנית היומית מהודקת ל-ATR לטווח של ימים.")
+
+    with st.expander("נתוני התבנית המלאים"):
+        if r.get("kind") == "breakdown":
+            st.markdown(stat_grid([
+                ("שבירה", f"{r['brk_pct']:.1f}%", ""), ("נפח שבירה", f"{r['spike']:.2f}×", ""),
+                ("תפיסה מחדש", f"{r['reclaim_pct']:+.1f}%", ""),
+                ("תמיכה", f"${r['support']:.2f}", ""), ("התנגדות", f"${r['resistance']:.2f}", ""),
+                ("ATR", f"${r['atr']:.2f}", ""), ("ATR %", f"{r['atr_pct']:.1f}%", ""),
+                ("RVOL", f"{r['rvol']:.2f}", ""),
+                ("מעל SMA200", "כן" if r.get("above200") else ("לא" if r.get("above200") is False else "—"), ""),
+                ("RS מול SPY", f"{r['rs']:+.1f}%" if r.get("rs") is not None else "—", ""),
+                ("דוח בעוד", f"{r['earn_days']} ימים" if r.get("earn_days") is not None else "לא נבדק", ""),
+            ]), unsafe_allow_html=True)
+        else:
+            st.markdown(stat_grid([
+                ("יובש נפח", f"{r['dry']:.2f}×", "gd"), ("נפח בזינוק", f"{r['spike']:.2f}×", ""),
+                ("זינוק", f"+{r['rise']:.0f}%", "up"), ("ימי זינוק", f"{r['leg_bars']}", ""),
+                ("תיקון", f"{r['retrace']:.0f}%", ""), ("ימים מהשיא", f"{r['age']}", ""),
+                ("ATR", f"${r['atr']:.2f}", ""), ("ATR %", f"{r['atr_pct']:.1f}%", ""),
+                ("RVOL", f"{r['rvol']:.2f}", ""), ("R:R ל-TP1", f"1:{r['rr']:.1f}", "gd"),
+                ("R:R ל-TP3", f"1:{r['rr3']:.1f}", ""),
+                ("בולינג׳ר", ", ".join(r.get("bb", [])) or "—", ""),
+                ("מעל SMA200", "כן" if r.get("above200") else ("לא" if r.get("above200") is False else "—"), ""),
+                ("RS מול SPY", f"{r['rs']:+.1f}%" if r.get("rs") is not None else "—", ""),
+                ("דוח בעוד", f"{r['earn_days']} ימים" if r.get("earn_days") is not None else "לא נבדק", ""),
+            ]), unsafe_allow_html=True)
+    st.stop()
+
+# ---------------------------------------------------------------- scan
+
+if go_:
+    t0 = time.time()
+    uni, uni_log = build_universe(limit)
+    st.caption("יקום: " + " · ".join(uni_log) + f"  →  **{len(uni):,}** מניות ייחודיות")
+
+    spy_ret21 = None
+    spy_data = fetch(("SPY",)).get("SPY")
+    if spy_data is not None and len(spy_data) > 21:
+        sc = spy_data["Close"].values.astype(float)
+        spy_ret21 = float((sc[-1] / sc[-22] - 1) * 100)
+    C["spy_ret21"] = spy_ret21
+    CB["spy_ret21"] = spy_ret21
+
+    prog, note = st.progress(0.0), st.empty()
+    rows, drop, liq, last_bar = [], {}, 0, None
+    batches = [tuple(uni[i:i + 120]) for i in range(0, len(uni), 120)]
+    for i, b in enumerate(batches):
+        note.caption(f"{i+1} / {len(batches)}  ·  {len(rows)} התאמות")
+        for t, d in fetch(b).items():
+            try:
+                p = float(d["Close"].iloc[-1])
+                if p < min_px:
+                    drop["מחיר נמוך"] = drop.get("מחיר נמוך", 0) + 1
+                    continue
+                avg_sh = float(d["Volume"].tail(20).mean())
+                if p * avg_sh < min_dv * 1e6:
+                    drop["מחזור נמוך"] = drop.get("מחזור נמוך", 0) + 1
+                    continue
+                if min_sh > 0 and avg_sh < min_sh * 1e6:
+                    drop["נפח מניות נמוך"] = drop.get("נפח מניות נמוך", 0) + 1
+                    continue
+                liq += 1
+                if last_bar is None:
+                    last_bar = d.index[-1]
+                A = prep(d)
+                found_here = []
+                if ptype in ("זינוק ותיקון לתמיכה", "שתי התבניות"):
+                    r, why = core(A, len(A["c"]) - 1, C)
+                    if r is None:
+                        drop[why] = drop.get(why, 0) + 1
+                    else:
+                        r["kind"] = "pullback"
+                        r["why"] = why_he(r)
+                        found_here.append(r)
+                if ptype in ("שבירת תמיכה ותפיסה מחדש", "שתי התבניות"):
+                    rb, whyb = core_breakdown(A, len(A["c"]) - 1, CB)
+                    if rb is None:
+                        drop["שבירה: " + whyb] = drop.get("שבירה: " + whyb, 0) + 1
+                    else:
+                        rb["why"] = why_breakdown(rb)
+                        found_here.append(rb)
+                for r in found_here:
+                    sh = int((acct * riskp / 100) / r["risk_share"])
+                    r.update(ticker=t, shares=sh,
+                             risk_total=round(sh * r["risk_share"], 2))
+                    rows.append(r)
+            except Exception:
+                drop["שגיאה"] = drop.get("שגיאה", 0) + 1
+        prog.progress((i + 1) / len(batches))
+    prog.empty()
+    note.empty()
+    if earn_days > 0 and rows:
+        note2 = st.empty()
+        kept = []
+        for k, r in enumerate(rows):
+            note2.caption(f"בודק דוחות רבעוניים: {k+1}/{len(rows)}")
+            d2e = days_to_earnings(r["ticker"])
+            r["earn_days"] = d2e
+            if d2e is not None and 0 <= d2e <= earn_days:
+                drop[f"דוח בעוד {earn_days} ימים או פחות"] = \
+                    drop.get(f"דוח בעוד {earn_days} ימים או פחות", 0) + 1
+                continue
+            kept.append(r)
+        rows = kept
+        note2.empty()
+    for r in rows:
+        v_ = rank_verdict(r)
+        r["tier"], r["tier_color"] = v_["tier"], v_["color"]
+        r["verdict_headline"], r["verdict_detail"] = v_["headline"], v_["detail"]
+        r["_sort"] = v_["sort"]
+    rows.sort(key=lambda x: x["_sort"])
+    st.session_state.update(
+        rows=rows, stats=(len(uni), liq), drop=drop, open=None,
+        scanned_at=datetime.now(il).strftime("%H:%M"),
+        took=round(time.time() - t0, 1), cached=not fresh,
+        data_date=last_bar.strftime("%d.%m.%y") if last_bar is not None else "—")
+
+# ---------------------------------------------------------------- results
+
+if "rows" not in st.session_state:
+    if wl_load():
+        st.info("הרשימה שלך למעלה נשמרת בכתובת הדף — סמן אותה במועדפים כדי לחזור אליה "
+                "מכל מכשיר, כולל הטלפון.")
+    else:
+        st.markdown('<div class="empty">בחר פריסט או הגדר סינון, ולחץ על סריקה.<br>'
+                    'המערכת מחפשת מניות שזינקו בנפח, תיקנו בנפח נמוך, '
+                    'ונמצאות עכשיו על התמיכה.<br><br>'
+                    'מניה שתסמן ב-☆ תישאר ברשימת המעקב למעלה, בזמן אמת, '
+                    'עד שהיא תפגע בסטופ או תגיע ל-TP3.</div>', unsafe_allow_html=True)
+else:
+    rows = st.session_state["rows"]
+    u, l_ = st.session_state["stats"]
+    top_dry = max((r["dry"] for r in rows), default=0)
+    took = st.session_state.get("took", 0)
+    src = "מטמון" if st.session_state.get("cached") else "הורדה טרייה"
+    st.markdown(f"""<div class="kpi">
+<div><b>{u:,}</b><span>נסרקו</span></div>
+<div><b>{l_:,}</b><span>עברו נזילות</span></div>
+<div class="hi"><b>{len(rows)}</b><span>בתבנית</span></div>
+<div><b>{top_dry:.2f}×</b><span>יובש מרבי</span></div>
+<div><b>{st.session_state.get('data_date','—')}</b><span>נתונים עד</span></div>
+<div><b>{took:.0f}s</b><span>{src}</span></div>
+<div><b>{st.session_state.get('scanned_at','—')}</b><span>נסרק בשעה</span></div>
+</div>""", unsafe_allow_html=True)
+    if st.session_state.get("cached") and took < 20:
+        st.caption("הסריקה הייתה מהירה כי הנתונים כבר היו שמורים מסריקה קודמת "
+                   "(נשמרים לשעה). ללחיצה על ↻ תרד הורדה טרייה מהשוק.")
+
+    tb = top_blocker(st.session_state["drop"])
+    if tb:
+        tb_k, tb_v = tb
+        tb_pct = tb_v / max(u, 1) * 100
+        st.markdown(f'<div class="blocker">המסנן שחוסם הכי הרבה מניות: '
+                    f'<b>{tb_k}</b> ({tb_v:,} מניות, {tb_pct:.0f}% מהיקום) — '
+                    f'פרטים מלאים בפאנל "מפל הסינון" למטה.</div>',
+                    unsafe_allow_html=True)
 
     if not rows:
-        st.warning(
-            "לא נמצאו תבניות. במקום לבטל את כל המסננים, "
-            "הפחת בהדרגה את דרישת קפיצת הנפח, יובש הנפח "
-            "או יחס הסיכוי-סיכון."
-        )
-
+        st.markdown('<div class="empty">אין מניות בתבנית בסינון הזה.<br>'
+                    'התבנית נדירה — נסה את הפריסט הרחב לפני שאתה מרפה ידנית.</div>',
+                    unsafe_allow_html=True)
+        with st.expander("מפל הסינון — איפה המניות נפלו", expanded=True):
+            fc = funnel_chart(st.session_state["drop"])
+            if fc:
+                st.plotly_chart(fc, use_container_width=True, config={"displayModeBar": False})
+            st.caption("השורה הארוכה ביותר היא המסנן שחוסם הכי הרבה. הרפה אותו ראשון.")
     else:
-        st.subheader("🔥 התבניות המדורגות")
+        v1, v2, v3 = st.columns([1.4, 1.6, 1])
+        view = v1.radio("תצוגה", ["כרטיסים", "טבלה"], horizontal=True,
+                        label_visibility="collapsed")
+        srt = v2.selectbox("מיון", ["המלצה (מבוסס בדיקה היסטורית)", "יובש נפח",
+                                    "יחס סיכון־סיכוי", "קרוב להפעלה", "הכי קרוב לתמיכה",
+                                    "טרי (ימים מהשיא)", "גודל הזינוק"],
+                           label_visibility="collapsed")
+        only_near = v3.checkbox("רק קרובות להפעלה")
+        keyf = {"המלצה (מבוסס בדיקה היסטורית)": lambda x: x.get("_sort", (9, 0)),
+                "יובש נפח": lambda x: -x["dry"],
+                "יחס סיכון־סיכוי": lambda x: -x["rr"],
+                "קרוב להפעלה": lambda x: x["to_entry"],
+                "הכי קרוב לתמיכה": lambda x: x.get("off_low", 999),
+                "טרי (ימים מהשיא)": lambda x: x["age"],
+                "גודל הזינוק": lambda x: -x["rise"]}[srt]
+        rows = sorted(rows, key=keyf)
+        if srt == "המלצה (מבוסס בדיקה היסטורית)":
+            has_pullback = any(x.get("kind") != "breakdown" for x in rows)
+            has_breakdown = any(x.get("kind") == "breakdown" for x in rows)
+            if has_pullback and has_breakdown:
+                st.caption("ממוין קודם לפי איכות התבנית (יובש נפח מוכח לעומת שבירת "
+                           "תמיכה שטרם נבדקה), ובתוך כל רמה — לפי טריות התיקון. "
+                           "מספר גבוה יותר של יובש נפח אינו אוטומטית טוב יותר.")
+            elif has_pullback:
+                st.caption("ממוין לפי קרבה לטווח היובש שהוכח רווחי (1.30–1.60), ובתוך "
+                           "הטווח — לפי טריות התיקון. מניה עם יובש 3.5× לא בהכרח טובה "
+                           "יותר ממניה עם 1.45×, וגם לא אם התיקון שלה ישן בהרבה יותר.")
+            else:
+                st.caption("תבנית שבירת התמיכה עדיין לא נבדקה היסטורית — כל התוצאות "
+                           "כאן מסומנות ברמה '?' ומוין רק לפי טריות. התייחס בזהירות.")
+        if only_near:
+            rows = [x for x in rows if x["to_entry"] <= 1.0]
+        if not rows:
+            st.info("אין מניות בטווח של 1% מרמת ההפעלה כרגע.")
+            st.stop()
+        for idx, rr in enumerate(rows):
+            rr["_rank"] = idx + 1
+        total_n = len(rows)
+        if view == "טבלה":
+            t = pd.DataFrame([{
+                "#": r["_rank"],
+                "מניה": r["ticker"],
+                "סוג": "שבירה" if r.get("kind") == "breakdown" else "תיקון",
+                "יובש/שבירה": r["dry"], "מחיר": r["price"],
+                "כניסה": r["entry"], "% לכניסה": r["to_entry"], "סטופ": r["stop"],
+                "TP1": r["tp1"], "TP2": r["tp2"], "TP3": r["tp3"], "R:R": r["rr"],
+                "כמות": r["shares"], "סיכון $": r["risk_total"], "ATR $": r["atr"],
+                "RVOL": r["rvol"], "תיקון %": r["retrace"], "ימים": r["age"],
+                "בולינג׳ר": ", ".join(r.get("bb", [])) or "—"} for r in rows])
+            st.dataframe(t, hide_index=True, use_container_width=True, height=460,
+                         column_config={
+                             "יובש/שבירה": st.column_config.ProgressColumn(
+                                 "יובש/שבירה", format="%.2f", min_value=1.0, max_value=2.5),
+                             "R:R": st.column_config.ProgressColumn(
+                                 "R:R", format="1:%.1f", min_value=0.0, max_value=4.0),
+                             "מחיר": st.column_config.NumberColumn(format="$%.2f"),
+                             "כניסה": st.column_config.NumberColumn(format="$%.2f"),
+                             "סטופ": st.column_config.NumberColumn(format="$%.2f"),
+                             "TP1": st.column_config.NumberColumn(format="$%.2f"),
+                             "TP2": st.column_config.NumberColumn(format="$%.2f"),
+                             "TP3": st.column_config.NumberColumn(format="$%.2f"),
+                             "% לכניסה": st.column_config.NumberColumn(format="%+.2f%%")})
+            pick = st.selectbox("פתח ניתוח", [r["ticker"] for r in rows])
+            tb1, tb2 = st.columns([3, 1])
+            if tb1.button("פתח", type="primary", use_container_width=True):
+                st.session_state["open"] = pick
+                st.rerun()
+            wl_tickers = {x["ticker"] for x in wl_load()}
+            picked_row = next(r for r in rows if r["ticker"] == pick)
+            star = "★ הסר ממעקב" if pick in wl_tickers else "☆ הוסף למעקב"
+            if tb2.button(star, use_container_width=True):
+                wl_toggle(picked_row)
+                st.rerun()
+        else:
+            wl_tickers = {x["ticker"] for x in wl_load()}
+            live_now = live(tuple(r["ticker"] for r in rows))
+            age_ceiling = C["age_hi"]
+            for start in range(0, len(rows), 3):
+                cols = st.columns(3, gap="medium")
+                for col, r in zip(cols, rows[start:start + 3]):
+                    with col:
+                        lp = live_now.get(r["ticker"])
+                        cur_px = float(lp["Close"].iloc[-1]) if lp is not None and len(lp) else r["price"]
+                        triggered = cur_px >= r["entry"]
+                        aging = (age_ceiling - r["age"]) <= 3
+                        st.markdown(card(r, best=(r is rows[0]),
+                                         watched=(r["ticker"] in wl_tickers),
+                                         triggered=triggered, aging=aging,
+                                         rank=r["_rank"], total=total_n),
+                                    unsafe_allow_html=True)
+                        bo, bw = st.columns([3, 1])
+                        if bo.button("פתח ניתוח", key=f"o{r['ticker']}",
+                                     use_container_width=True):
+                            st.session_state["open"] = r["ticker"]
+                            st.rerun()
+                        star = "★" if r["ticker"] in wl_tickers else "☆"
+                        if bw.button(star, key=f"w{r['ticker']}", use_container_width=True,
+                                     help="הוסף/הסר מרשימת המעקב"):
+                            wl_toggle(r)
+                            st.rerun()
 
-        card_columns = st.columns(3, gap="large")
+        with st.expander("מפל הסינון — איפה המניות נפלו"):
+            fc = funnel_chart(st.session_state["drop"])
+            if fc:
+                st.plotly_chart(fc, use_container_width=True, config={"displayModeBar": False})
 
-        for index, result in enumerate(rows[:15]):
-            with card_columns[index % 3]:
-                st.markdown(
-                    card_html(result, is_top=index == 0),
-                    unsafe_allow_html=True,
-                )
-
-        st.subheader("טבלת תוצאות מלאה")
-
-        table = results_table(rows)
-
-        st.dataframe(
-            table,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Score": st.column_config.ProgressColumn(
-                    "Score",
-                    min_value=0,
-                    max_value=100,
-                    format="%.1f",
-                ),
-                "Price": st.column_config.NumberColumn(
-                    "Price",
-                    format="$%.2f",
-                ),
-                "Entry": st.column_config.NumberColumn(
-                    "Entry",
-                    format="$%.2f",
-                ),
-                "Stop": st.column_config.NumberColumn(
-                    "Stop",
-                    format="$%.2f",
-                ),
-                "Target 1": st.column_config.NumberColumn(
-                    "Target 1",
-                    format="$%.2f",
-                ),
-                "Risk $": st.column_config.NumberColumn(
-                    "Risk $",
-                    format="$%.2f",
-                ),
-            },
-        )
-
-        csv_bytes = table.to_csv(index=False).encode("utf-8-sig")
-
-        st.download_button(
-            label="הורד תוצאות CSV",
-            data=csv_bytes,
-            file_name="mavri_scan.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        df = pd.DataFrame([{k: v for k, v in r.items() if k not in ("spark", "_daily")}
+                           for r in rows])
+        z1, z2 = st.columns(2)
+        z1.download_button("הורד CSV", df.to_csv(index=False),
+                           f"mavri_{datetime.now():%Y%m%d}.csv", "text/csv",
+                           use_container_width=True)
+        z2.code(",".join(df["ticker"].tolist()), language=None)

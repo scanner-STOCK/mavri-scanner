@@ -660,6 +660,7 @@ def core_breakdown(A, i, C):
                 risk_share=round(float(risk), 2), to_entry=round((entry / px - 1) * 100, 2),
                 rvol=round(rvol, 2), atr=round(a, 2), atr_pct=round(atr_pct, 1),
                 above200=above200, rs=(round(rs, 1) if rs is not None else None),
+                candle=rev_name, is_rev=bool(is_rev),
                 age=0, rise=round(brk_pct, 1), leg_bars=C["break_win"],
                 dry=round(brk_spike, 2), retrace=round(reclaim_dist, 1), bb=[],
                 off_low=round(reclaim_dist, 1),
@@ -854,6 +855,8 @@ def explain_ai(r, rank=None, total=None):
     elif r["rvol"] >= 1.3:
         liq.append(f"נפח הימים האחרונים כבר גבוה מהרגיל (RVOL {r['rvol']:.2f}) — "
                    f"ייתכן שהתנועה כבר החלה")
+    if r.get("candle") and r["candle"] != "אין נר היפוך":
+        liq.append(f"נר האיתות הוא {r['candle']} — אישור היפוך ולא סתם נר ירוק")
     if r.get("bb"):
         liq.append(f"נגעה ברצועת בולינג׳ר {' ו'.join(r['bb'])}, אישור טכני נוסף")
     if liq:
@@ -933,7 +936,11 @@ def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, 
     if rank is not None:
         rank_html = (f'<div class="rankball">{rank}'
                     f'<span>{f"/{total}" if total else ""}</span></div>')
-    ch = "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
+    ch = ""
+    _cand = r.get("candle")
+    if _cand and _cand != "אין נר היפוך":
+        ch += f'<span class="chip g">🕯 {_cand}</span>'
+    ch += "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
     ch += f'<span class="chip">ATR {r["atr"]:.2f}$ · RVOL {r["rvol"]:.2f}</span>'
     if r.get("rs") is not None:
         ch += f'<span class="chip">RS {r["rs"]:+.1f}%</span>'
@@ -1275,7 +1282,7 @@ with st.expander("סינון מתקדם"):
 
     st.markdown("##### מגמה, חוזק יחסי ודוחות — עדיין לא נבדקו בבדיקה היסטורית")
     p1, p2, p3, p4 = st.columns(4)
-    trend_hard = p1.checkbox("דרוש מעל SMA200", value=False,
+    trend_hard = p1.checkbox("דרוש מעל SMA200", value=True,
                              help="לסחור רק תיקונים בתוך מגמת עלייה ארוכת טווח. "
                                   "היגיון סטנדרטי במסחר, אך לא נבדק עדיין במערכת הזאת.")
     use_rs = p2.checkbox("דרוש חוזק מול השוק", value=False,
@@ -1286,7 +1293,7 @@ with st.expander("סינון מתקדם"):
                                      "הסינון — לא כל היקום, כדי לא להאט את הסריקה.")
 
     q1, q2, q3 = st.columns(3)
-    rev_hard = q1.checkbox("דרוש נר היפוך איכותי", value=False,
+    rev_hard = q1.checkbox("דרוש נר היפוך איכותי", value=True,
                            help="נר שורי עם גוף משמעותי וסגירה בחלק העליון, פטיש, "
                                 "או בליעה שורית. נר ירוק קטן לא נחשב.")
     acct = q2.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
@@ -1730,6 +1737,7 @@ if st.session_state.get("open"):
                 ("RVOL", f"{r['rvol']:.2f}", ""), ("R:R ל-TP1", f"1:{r['rr']:.1f}", "gd"),
                 ("R:R ל-TP3", f"1:{r['rr3']:.1f}", ""),
                 ("בולינג׳ר", ", ".join(r.get("bb", [])) or "—", ""),
+                ("נר איתות", r.get("candle", "—"), "gd" if r.get("is_rev") else ""),
                 ("מעל SMA200", "כן" if r.get("above200") else ("לא" if r.get("above200") is False else "—"), ""),
                 ("RS מול SPY", f"{r['rs']:+.1f}%" if r.get("rs") is not None else "—", ""),
                 ("דוח בעוד", f"{r['earn_days']} ימים" if r.get("earn_days") is not None else "לא נבדק", ""),

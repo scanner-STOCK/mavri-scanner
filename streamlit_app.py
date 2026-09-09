@@ -248,7 +248,7 @@ def fetch_full_market():
          "ACT Symbol", "ETF", "Test Issue"),
     ]:
         try:
-            txt = requests.get(url, headers=UA, timeout=25).text
+            txt = requests.get(url, headers=UA, timeout=12).text
             df = pd.read_csv(io.StringIO(txt), sep="|")
             df = df[df[test_col].astype(str).str.upper() != "Y"]
             if etf_col in df.columns:
@@ -264,38 +264,16 @@ def fetch_full_market():
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def build_universe(limit):
-    got, log = [], []
-    for name, url, cols in [
-        ("S&P500", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", ("Symbol", "Ticker")),
-        ("S&P400", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", ("Symbol", "Ticker")),
-        ("S&P600", "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", ("Symbol", "Ticker")),
-        ("NDX", "https://en.wikipedia.org/wiki/Nasdaq-100", ("Ticker", "Symbol"))]:
-        n0 = 0
-        try:
-            html = requests.get(url, headers=UA, timeout=25).text
-            for tbl in pd.read_html(io.StringIO(html)):
-                hit = False
-                for col in cols:
-                    if col in tbl.columns:
-                        s = [str(x).strip().upper().replace(".", "-") for x in tbl[col]]
-                        s = [x for x in s if x.isascii() and 1 <= len(x) <= 6
-                             and x.replace("-", "").isalpha()]
-                        if len(s) > 50:
-                            got += s
-                            n0 = len(s)
-                            hit = True
-                        break
-                if hit:
-                    break
-        except Exception:
-            pass
-        log.append(f"{name}:{n0 or '—'}")
-
+    """Universe = NASDAQ Trader's official directory (~7,000 common stocks)
+    plus a curated backup list. The S&P 500/400/600 Wikipedia scrapes that used
+    to run here were removed: every S&P constituent is by definition listed on
+    NASDAQ or NYSE, so they were already inside the directory and contributed
+    zero unique tickers while costing four extra HTTP round trips."""
+    log = []
     full = fetch_full_market()
-    got += full
     log.append(f"NASDAQ/NYSE:{len(full) or '—'}")
 
-    got += [t.upper() for t in BACKUP]
+    got = list(full) + [t.upper() for t in BACKUP]
     log.append(f"רשימת גיבוי:{len(BACKUP)}")
 
     seen, out = set(), []
@@ -1276,9 +1254,10 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P.get("sh", 0.0)), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 200, 7000, 4000, 100,
-                      help="מעל 4000 לוקח משמעותית יותר זמן להוריד. "
-                           "המספר האמיתי הזמין מוצג אחרי הסריקה.")
+    limit = j4.slider("מספר מניות לסריקה", 200, 7000, 1200, 100,
+                      help="1200 = מהיר (כדקה). 4000 = יסודי אך איטי פי 3. "
+                           "הרשימה ממוינת לפי נזילות, כך שהמניות הסחירות ביותר "
+                           "נסרקות ראשונות.")
 
     st.markdown("##### מגמה, חוזק יחסי ודוחות — עדיין לא נבדקו בבדיקה היסטורית")
     p1, p2, p3, p4 = st.columns(4)

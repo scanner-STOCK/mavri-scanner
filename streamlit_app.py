@@ -287,7 +287,7 @@ def build_universe(limit):
     return out[:limit], log
 
 
-@st.cache_data(ttl=3600, max_entries=45, show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=8, show_spinner=False)
 def fetch(tickers, period="1y"):
     out = {}
     try:
@@ -307,7 +307,7 @@ def fetch(tickers, period="1y"):
     return out
 
 
-@st.cache_data(ttl=900, max_entries=40, show_spinner=False)
+@st.cache_data(ttl=900, max_entries=12, show_spinner=False)
 def fetch_one(t, period, interval):
     """Single ticker, any interval. Tries two different Yahoo endpoints with
     backoff before giving up — the two methods sometimes succeed independently
@@ -1419,6 +1419,18 @@ def render_watchlist():
         return
     st.markdown("### רשימת מעקב")
     tickers = tuple(x["ticker"] for x in wl)
+    # Do NOT hit the network on every page render — that added seconds to each
+    # rerun and made the whole app feel frozen. Quotes load on demand.
+    if not st.session_state.get("wl_live"):
+        names = " · ".join(tickers)
+        c1, c2 = st.columns([3, 1])
+        c1.markdown(f'<div class="tw" style="margin:0">{names}</div>',
+                    unsafe_allow_html=True)
+        if c2.button("טען מחירים", use_container_width=True):
+            st.session_state["wl_live"] = True
+            st.rerun()
+        st.markdown("---")
+        return
     data = live(tickers)
     active, closed = [], []
     for item in wl:

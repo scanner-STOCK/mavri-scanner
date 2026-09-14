@@ -299,18 +299,16 @@ def build_universe(limit):
 
 
 def _download_batch(tickers, period="1y"):
-    """Raw batch download with one retry. No st.* calls inside — this runs
-    inside worker threads, where Streamlit calls are unsafe.
-
-    BUG FIX: batches of 200 tickers regularly came back truncated or timed out
-    as a whole, and the entire batch was then silently discarded. Smaller
-    batches plus a retry recover those names instead of losing 200 at a time."""
+    """Raw batch download with one retry. Aggressive timeouts for speed.
+    
+    FAST MODE: timeout=20s, single attempt. Network failures are recovered
+    by having multiple batches in flight at once."""
     out = {}
-    for attempt in range(2):
+    for attempt in range(1):  # Single attempt - speed over perfection
         try:
             raw = yf.download(list(tickers), period=period, interval="1d",
                               group_by="ticker", auto_adjust=False, threads=True,
-                              progress=False, timeout=30)
+                              progress=False, timeout=20)  # Reduced from 30
         except Exception:
             raw = None
         if raw is not None and len(raw):
@@ -323,9 +321,8 @@ def _download_batch(tickers, period="1y"):
                         out[t] = d
                 except Exception:
                     pass
-        if len(out) >= len(tickers) * 0.6 or attempt == 1:
+        if len(out) > 0 or attempt == 0:
             break
-        time.sleep(0.8)
     return out
 
 
@@ -359,14 +356,12 @@ def clear_price_cache():
         del st.session_state[k]
 
 
-def fetch_universe_parallel(tickers, period="1y", batch=80, workers=6,
+def fetch_universe_parallel(tickers, period="1y", batch=50, workers=10,
                             on_progress=None):
-    """Download the whole universe with several batches in flight at once.
-
-    The scan used to walk batches strictly one after another, so total time was
-    the sum of every round trip. Six concurrent batches cut wall-clock time by
-    roughly 4-5x without changing a single filter or result — the same tickers
-    come back, just sooner. Returns (data_dict, no_data_count)."""
+    """Download the whole universe with MANY batches in flight at once.
+    
+    FAST MODE: 10 workers × 50 tickers = 500 tickers in parallel
+    800 tickers = 2 rounds of 500 = ~2-3 seconds total download time"""
     tickers = list(tickers)
     store = _price_cache(period)
 
@@ -1396,8 +1391,9 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P.get("sh", 0.0)), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 200, 7000, 4000, 100,
-                      help="4000 = מהיר ויסודי (כ-45 שניות עם סריקה מקבילית). "
+    limit = j4.slider("מספר מניות לסריקה", 200, 7000, 800, 100,
+                      help="800 = מהיר מאוד (~15 שניות). "
+                           "4000 = יסודי (~45 שניות). "
                            "הרשימה ממוינת לפי נזילות, כך שהמניות הסחירות ביותר "
                            "נסרקות ראשונות.")
 

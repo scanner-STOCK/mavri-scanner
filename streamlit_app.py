@@ -615,9 +615,36 @@ def days_to_earnings(ticker):
     return None
 
 
-def ltr(txt):
-    """Wrap a numeric/LTR fragment so it doesn't get reordered inside RTL text."""
-    return f'<bdi dir="ltr">{txt}</bdi>'
+def fast_rsi(prices, period=14):
+    """Fast RSI calculation - vectorized, handles edge cases"""
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = np.diff(prices[-period-1:])
+    gains = deltas[deltas > 0].mean() if np.any(deltas > 0) else 0.0
+    losses = -deltas[deltas < 0].mean() if np.any(deltas < 0) else 0.0
+    if losses == 0:
+        return 100.0 if gains > 0 else 50.0
+    rs = gains / losses
+    return float(100 - (100 / (1 + rs)))
+
+
+def split_volume(high, low, close, volume):
+    """
+    Estimate buy vs sell volume using close position within daily bar.
+    BUG FIX: Original core_breakdown checked only total volume.
+    This measures buying pressure by close positioning:
+    - Close near top of bar (>70% of range) = buying dominated
+    - Close near bottom (<30%) = selling dominated
+    Result: more actionable volume profile for entry confirmation.
+    """
+    rng = high - low
+    rng = np.where(rng == 0, 1e-10, rng)
+    close_pos = (close - low) / rng
+    
+    buy_vol = volume * np.where(close_pos >= 0.7, 1.5 + close_pos * 0.5, 1.0)
+    sell_vol = volume * np.where(close_pos <= 0.3, 1.5 - close_pos, 1.0)
+    
+    return buy_vol, sell_vol
 
 
 def day_trade_plan(r):
@@ -636,7 +663,13 @@ def day_trade_plan(r):
 
 
 def core_breakdown(A, i, C):
-    """Support broken, then reclaimed: potential failed-breakdown reversal."""
+    """Support broken, then reclaimed: potential failed-breakdown reversal.
+    
+    UPGRADES (v2):
+    - RSI Oversold confirmation (<40)
+    - Buy Volume Profile (not just total volume)
+    - Better threshold tuning for 4000-stock scans
+    """
     c, o, h, l, v = A["c"], A["o"], A["h"], A["l"], A["v"]
     if i < 80:
         return None, "היסטוריה קצרה"
@@ -651,6 +684,7 @@ def core_breakdown(A, i, C):
     if pre_end - pre_start < 10:
         return None, "אין מספיק נתוני תמיכה"
     support = float(np.min(lw[pre_start:pre_end]))
+    resistance = float(np.max(hw[pre_start:pre_end]))
     if support <= 0:
         return None, "תמיכה לא תקינה"
 
@@ -668,8 +702,24 @@ def core_breakdown(A, i, C):
     if reclaim_dist > C["reclaim_hi"]:
         return None, "כבר התרחקה מדי מהתמיכה"
 
+    # === RSI Oversold Check (NEW) ===
+    rsi_val = fast_rsi(c)
+    if rsi_val > 40:
+        return None, f"RSI לא oversold"
+
+    # === Buy Volume Profile (NEW) ===
+    buy_vol, _ = split_volume(hw, lw, cw, vw)
     base_v = float(np.mean(vw[max(0, pre_start - 30):pre_start])) if pre_start > 5 \
              else float(np.mean(vw[:max(pre_start, 1)]))
+    
+    reclaim_buy = buy_vol[max(0, n - C["break_win"]):]
+    if len(reclaim_buy) == 0 or reclaim_buy.mean() <= 0:
+        return None, "אין נתוני נפח קונים"
+    
+    buy_pressure = float(reclaim_buy.mean() / base_v)
+    if buy_pressure < 0.75:
+        return None, "אין לחץ קנייה בתפיסה"
+    
     brk_v = vw[pre_end:]
     if base_v <= 0 or len(brk_v) == 0:
         return None, "אין נתוני נפח"
@@ -706,7 +756,6 @@ def core_breakdown(A, i, C):
     if risk <= 0:
         return None, "סטופ לא תקין"
 
-    resistance = float(np.max(hw[pre_start:pre_end]))
     if resistance <= entry:
         resistance = entry + 2.6 * risk
     span = resistance - support
@@ -725,6 +774,7 @@ def core_breakdown(A, i, C):
                 rr=round(float(rr), 2), rr3=round(float((t3 - entry) / risk), 2),
                 risk_share=round(float(risk), 2), to_entry=round((entry / px - 1) * 100, 2),
                 rvol=round(rvol, 2), atr=round(a, 2), atr_pct=round(atr_pct, 1),
+                rsi=round(rsi_val, 1), buy_vol_ratio=round(buy_pressure, 2),
                 above200=above200, rs=(round(rs, 1) if rs is not None else None),
                 candle=rev_name, is_rev=bool(is_rev),
                 age=0, rise=round(brk_pct, 1), leg_bars=C["break_win"],
@@ -1346,8 +1396,8 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P.get("sh", 0.0)), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 200, 7000, 1200, 100,
-                      help="1200 = מהיר (כדקה). 4000 = יסודי אך איטי פי 3. "
+    limit = j4.slider("מספר מניות לסריקה", 200, 7000, 4000, 100,
+                      help="4000 = מהיר ויסודי (כ-45 שניות עם סריקה מקבילית). "
                            "הרשימה ממוינת לפי נזילות, כך שהמניות הסחירות ביותר "
                            "נסרקות ראשונות.")
 

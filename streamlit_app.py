@@ -610,6 +610,11 @@ def days_to_earnings(ticker):
     return None
 
 
+def ltr(txt):
+    """Wrap a numeric/LTR fragment so it doesn't get reordered inside RTL text."""
+    return f'<bdi dir="ltr">{txt}</bdi>'
+
+
 def fast_rsi(prices, period=14):
     """Fast RSI calculation - vectorized, handles edge cases"""
     if len(prices) < period + 1:

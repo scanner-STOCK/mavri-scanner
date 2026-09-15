@@ -356,12 +356,16 @@ def clear_price_cache():
         del st.session_state[k]
 
 
-def fetch_universe_parallel(tickers, period="1y", batch=50, workers=10,
+def fetch_universe_parallel(tickers, period="1y", batch=120, workers=3,
                             on_progress=None):
-    """Download the whole universe with MANY batches in flight at once.
-    
-    FAST MODE: 10 workers × 50 tickers = 500 tickers in parallel
-    800 tickers = 2 rounds of 500 = ~2-3 seconds total download time"""
+    """Download the universe with a few batches in flight at once.
+
+    TUNED FOR STREAMLIT COMMUNITY CLOUD: the free tier gives roughly one CPU,
+    and it throttles apps that peg it. Ten worker threads each unpacking a
+    MultiIndex DataFrame was enough to trip that throttle within a single scan.
+    Three workers on larger batches move the same data with a fraction of the
+    thread-scheduling and parsing overhead — slower by a few seconds, but the
+    app keeps its CPU instead of getting capped for 24 hours."""
     tickers = list(tickers)
     store = _price_cache(period)
 
@@ -1396,11 +1400,12 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P.get("sh", 0.0)), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 200, 7000, 800, 100,
-                      help="800 = מהיר מאוד (~15 שניות). "
-                           "4000 = יסודי (~45 שניות). "
-                           "הרשימה ממוינת לפי נזילות, כך שהמניות הסחירות ביותר "
-                           "נסרקות ראשונות.")
+    limit = j4.slider("מספר מניות לסריקה", 100, 7000, 300, 100,
+                      help="ב-Streamlit חינמי יש בערך מעבד אחד. 300 מניות = "
+                           "סריקה נוחה שלא נחנקת. 800 עדיין בסדר. מעל 1500 "
+                           "הפלטפורמה עלולה לחנוק את האפליקציה ל-24 שעות. "
+                           "לסריקה של 4000 מניות הרץ את הקוד על המחשב שלך. "
+                           "הרשימה ממוינת לפי נזילות — המניות הסחירות ביותר ראשונות.")
 
     st.markdown("##### מגמה, חוזק יחסי ודוחות — עדיין לא נבדקו בבדיקה היסטורית")
     p1, p2, p3, p4 = st.columns(4)
@@ -1909,8 +1914,8 @@ if go_:
         prog.progress(min(frac * 0.75, 0.75))
         note.caption(f"מוריד נתונים · {got:,} מניות התקבלו")
 
-    market, no_data = fetch_universe_parallel(uni, period="1y", batch=80,
-                                              workers=6, on_progress=_tick)
+    market, no_data = fetch_universe_parallel(uni, period="1y", batch=120,
+                                              workers=3, on_progress=_tick)
     if no_data:
         # BUG FIX: tickers that Yahoo returned nothing for used to vanish
         # silently. The KPI bar then claimed "1,200 נסרקו" when only a few
@@ -2160,7 +2165,20 @@ else:
                 st.rerun()
         else:
             wl_tickers = {x["ticker"] for x in wl_load()}
-            live_now = live(tuple(r["ticker"] for r in rows))
+            # CPU FIX: this used to call live() on every matched ticker on every
+            # single rerun — a fresh multi-ticker download just to decide whether
+            # to print a "כבר הופעל" badge. Clicking any button paid for it again.
+            # The scan's own closing price answers the same question for free;
+            # the live quote is now opt-in.
+            if st.session_state.get("cards_live"):
+                live_now = live(tuple(r["ticker"] for r in rows))
+            else:
+                live_now = {}
+                st.caption("מחירי הכרטיסים הם מסגירת הסריקה. "
+                           "לבדיקה מול מחיר עכשווי לחץ על הכפתור למטה.")
+                if st.button("טען מחירים עדכניים לכרטיסים"):
+                    st.session_state["cards_live"] = True
+                    st.rerun()
             age_ceiling = C["age_hi"]
             for start in range(0, len(rows), 3):
                 cols = st.columns(3, gap="medium")

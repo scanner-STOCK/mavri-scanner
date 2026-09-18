@@ -356,6 +356,126 @@ def clear_price_cache():
         del st.session_state[k]
 
 
+def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=200,
+                       workers=3, on_progress=None):
+    """Cheap first pass: 10 daily bars per ticker instead of a full year.
+
+    WHY THIS EXISTS — this is what makes a 4,000-name scan possible at all.
+    Downloading 252 daily bars for 4,000 tickers means parsing roughly a
+    million rows, and unpacking that many MultiIndex frames is exactly what
+    pegged the CPU and got the app throttled for 24 hours. But the first two
+    filters the scan applies — minimum price and minimum dollar volume — only
+    ever look at the last few bars. There is no reason to pay for a year of
+    history on a name that is about to be rejected for trading 200k a day.
+
+    So: pull 10 bars for everyone (about 25x less data), throw out everything
+    illiquid, and let the expensive full-history download run only on the
+    survivors. On a typical 4,000-name universe that is ~700 survivors, so the
+    heavy stage shrinks by roughly 5x on top of the 25x saved here.
+
+    Returns (survivor_tickers, price_map, drop_counts)."""
+    out, drops = [], {}
+    prices = {}
+    tickers = list(tickers)
+    batches = [tuple(tickers[i:i + batch]) for i in range(0, len(tickers), batch)]
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_download_light, b): b for b in batches}
+        for fut in as_completed(futs):
+            try:
+                got = fut.result() or {}
+            except Exception:
+                got = {}
+            for t, (px, dv) in got.items():
+                if px < min_price:
+                    drops["מחיר נמוך"] = drops.get("מחיר נמוך", 0) + 1
+                    continue
+                if dv < min_dollar_vol_m * 1e6:
+                    drops["מחזור נמוך"] = drops.get("מחזור נמוך", 0) + 1
+                    continue
+                out.append(t)
+                prices[t] = px
+            done += 1
+            if on_progress:
+                on_progress(done / len(batches), len(out))
+    missing = len(tickers) - sum(drops.values()) - len(out)
+    if missing > 0:
+        drops["לא התקבלו נתונים"] = missing
+    return out, prices, drops
+
+
+def _download_light(tickers):
+    """10 bars per ticker, reduced to (last_close, avg_dollar_volume).
+
+    Returns scalars, not DataFrames — nothing heavy is kept in memory, which
+    is the whole point of the prescreen."""
+    out = {}
+    try:
+        raw = yf.download(list(tickers), period="10d", interval="1d",
+                          group_by="ticker", auto_adjust=False, threads=True,
+                          progress=False, timeout=25)
+    except Exception:
+        return out
+    if raw is None or len(raw) == 0:
+        return out
+    for t in tickers:
+        try:
+            d = (raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw).dropna()
+            if len(d) < 3:
+                continue
+            px = float(d["Close"].iloc[-1])
+            vol = float(d["Volume"].tail(10).mean())
+            if px > 0 and vol > 0:
+                out[t] = (px, px * vol)
+        except Exception:
+            pass
+    return out
+
+
+def extended_hours_quote(ticker):
+    """Latest pre-market / after-hours price against the regular-session close.
+
+    yfinance exposes extended-hours bars through prepost=True on intraday
+    intervals. This is only ever called on the handful of names that already
+    matched the pattern — never on the scanned universe — because it is one
+    network call per ticker.
+
+    Returns dict(price, change_pct, session) or None."""
+    try:
+        d = yf.download(ticker, period="2d", interval="5m", prepost=True,
+                        auto_adjust=False, progress=False, timeout=15,
+                        threads=False)
+        if d is None or len(d) == 0:
+            return None
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
+        d = d.dropna()
+        if len(d) < 2:
+            return None
+        idx = d.index.tz_convert(NY) if d.index.tz is not None else d.index
+        last_ts = idx[-1]
+        mins = last_ts.hour * 60 + last_ts.minute
+        if mins < 9 * 60 + 30:
+            sess = "פרה-מרקט"
+        elif mins >= 16 * 60:
+            sess = "אפטר-מרקט"
+        else:
+            sess = "מסחר רגיל"
+        # Regular-session close = last bar at or before 16:00 on the last day.
+        reg = d[[(t.hour * 60 + t.minute) < 16 * 60 for t in idx]]
+        if len(reg) == 0:
+            return None
+        ref = float(reg["Close"].iloc[-1])
+        last = float(d["Close"].iloc[-1])
+        if ref <= 0:
+            return None
+        return dict(price=round(last, 2),
+                    change_pct=round((last / ref - 1) * 100, 2),
+                    session=sess)
+    except Exception:
+        return None
+
+
 def fetch_universe_parallel(tickers, period="1y", batch=120, workers=3,
                             on_progress=None):
     """Download the universe with a few batches in flight at once.
@@ -1089,6 +1209,16 @@ def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, 
     if r.get("undersized"):
         badges += ('<span class="badge" style="background:rgba(224,96,95,.16);'
                    'color:var(--sh)">סטופ רחב לתיק</span>')
+    if r.get("eh_change") is not None:
+        _ehc = r["eh_change"]
+        _col = "var(--lg)" if _ehc > 0 else ("var(--sh)" if _ehc < 0 else "var(--dm)")
+        _bg = ("rgba(47,191,143,.14)" if _ehc > 0
+               else ("rgba(224,96,95,.14)" if _ehc < 0 else "rgba(147,168,178,.12)"))
+        badges += (f'<span class="badge" style="background:{_bg};color:{_col}">'
+                   f'{r.get("eh_session", "מורחב")} {_ehc:+.1f}%</span>')
+    if r.get("eh_triggered"):
+        badges += ('<span class="badge" style="background:rgba(212,166,75,.2);'
+                   'color:var(--gd)">פרץ במסחר מורחב</span>')
     is_bd = r.get("kind") == "breakdown"
     if is_bd:
         badges = ('<span class="badge" style="background:rgba(138,111,176,.16);'
@@ -1400,12 +1530,12 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P.get("sh", 0.0)), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 100, 7000, 300, 100,
-                      help="ב-Streamlit חינמי יש בערך מעבד אחד. 300 מניות = "
-                           "סריקה נוחה שלא נחנקת. 800 עדיין בסדר. מעל 1500 "
-                           "הפלטפורמה עלולה לחנוק את האפליקציה ל-24 שעות. "
-                           "לסריקה של 4000 מניות הרץ את הקוד על המחשב שלך. "
-                           "הרשימה ממוינת לפי נזילות — המניות הסחירות ביותר ראשונות.")
+    limit = j4.slider("מספר מניות לסריקה", 100, 7000, 2500, 100,
+                      help="הסריקה עובדת בשני שלבים: קודם 10 נרות לכל מנייה "
+                           "(זול) כדי לפסול לא-נזילות, ורק אחר כך שנה שלמה "
+                           "למי ששרד. לכן 2500 מניות אפשרי גם בענן החינמי. "
+                           "אם האפליקציה נחנקת — הורד ל-1500. "
+                           "על המחשב שלך אפשר 7000 בלי בעיה.")
 
     st.markdown("##### מגמה, חוזק יחסי ודוחות — עדיין לא נבדקו בבדיקה היסטורית")
     p1, p2, p3, p4 = st.columns(4)
@@ -1425,6 +1555,12 @@ with st.expander("סינון מתקדם"):
                                 "או בליעה שורית. נר ירוק קטן לא נחשב.")
     acct = q2.number_input("גודל תיק $", 500, 5_000_000, 25_000, 500)
     riskp = q3.slider("סיכון לעסקה %", 0.25, 5.0, 0.5, 0.25)
+
+    use_prepost = st.checkbox(
+        "בדוק פרה-מרקט ואפטר-מרקט למניות שנמצאו", value=True,
+        help="הנרות היומיים נגמרים בסגירה ב-16:00. מניה שקפצה 6% בפרה-מרקט "
+             "היא כבר לא אותה עסקה שהכרטיס מתאר. הבדיקה רצה רק על ההתאמות "
+             "(לא על כל היקום) ומוסיפה כשנייה לכל מנייה שנמצאה.")
 
 C = dict(leg_min=leg_min, leg_max=leg_max, rise_min=rise_min, retr_lo=retr[0],
          retr_hi=retr[1], age_lo=agev[0], age_hi=agev[1], atr_pct=atr_pct,
@@ -1909,26 +2045,32 @@ if go_:
     prog, note = st.progress(0.0), st.empty()
     rows, drop, liq, last_bar = [], {}, 0, None
 
-    # --- phase 1: download everything, several batches at a time -------------
-    def _tick(frac, got):
-        prog.progress(min(frac * 0.75, 0.75))
-        note.caption(f"מוריד נתונים · {got:,} מניות התקבלו")
+    # --- stage 1: cheap prescreen (10 bars) to kill illiquid names ----------
+    def _tick_pre(frac, kept):
+        prog.progress(min(frac * 0.35, 0.35))
+        note.caption(f"סינון מקדים · {kept:,} מניות עברו נזילות")
 
-    market, no_data = fetch_universe_parallel(uni, period="1y", batch=120,
+    survivors, _pre_px, pre_drops = prescreen_universe(
+        uni, min_price=min_px, min_dollar_vol_m=min_dv,
+        batch=200, workers=3, on_progress=_tick_pre)
+    drop.update(pre_drops)
+
+    # --- stage 2: full history for survivors only ---------------------------
+    def _tick(frac, got):
+        prog.progress(0.35 + min(frac * 0.45, 0.45))
+        note.caption(f"מוריד היסטוריה · {got:,} מתוך {len(survivors):,}")
+
+    market, no_data = fetch_universe_parallel(survivors, period="1y", batch=120,
                                               workers=3, on_progress=_tick)
     if no_data:
-        # BUG FIX: tickers that Yahoo returned nothing for used to vanish
-        # silently. The KPI bar then claimed "1,200 נסרקו" when only a few
-        # hundred were ever examined, and the funnel never accounted for the
-        # difference. Now they are counted like any other drop reason.
-        drop["לא התקבלו נתונים"] = no_data
+        drop["לא התקבלו נתונים"] = drop.get("לא התקבלו נתונים", 0) + no_data
 
-    # --- phase 2: filter + pattern match (pure CPU, no network) --------------
+    # --- stage 3: pattern match (pure CPU, no network) ----------------------
     items = list(market.items())
     for i, (t, d) in enumerate(items):
         if i % 150 == 0:
             note.caption(f"מנתח {i:,} / {len(items):,}  ·  {len(rows)} התאמות")
-            prog.progress(0.75 + 0.25 * (i / max(len(items), 1)))
+            prog.progress(0.80 + 0.20 * (i / max(len(items), 1)))
         try:
             p = float(d["Close"].iloc[-1])
             if p < min_px:
@@ -1996,6 +2138,24 @@ if go_:
         r["verdict_headline"], r["verdict_detail"] = v_["headline"], v_["detail"]
         r["_sort"] = v_["sort"]
     rows.sort(key=lambda x: x["_sort"])
+
+    # Extended-hours check on matches only. The daily bars the pattern is built
+    # from stop at the 16:00 close, so a name that already gapped 6% in the
+    # pre-market is a different trade than the one the card describes. One
+    # network call per match — affordable because matches are few.
+    if use_prepost and rows:
+        note3 = st.empty()
+        for k, r in enumerate(rows[:40]):
+            note3.caption(f"בודק פרה/אפטר מרקט: {k+1}/{min(len(rows), 40)}")
+            eh = extended_hours_quote(r["ticker"])
+            if eh:
+                r["eh_price"] = eh["price"]
+                r["eh_change"] = eh["change_pct"]
+                r["eh_session"] = eh["session"]
+                # A gap straight through the trigger changes the plan.
+                if eh["price"] >= r["entry"]:
+                    r["eh_triggered"] = True
+        note3.empty()
     st.session_state.update(
         rows=rows, stats=(len(uni), liq), got_data=len(market), drop=drop, open=None,
         scanned_at=datetime.now(il).strftime("%H:%M"),

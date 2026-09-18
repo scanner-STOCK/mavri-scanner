@@ -226,7 +226,7 @@ SE MELI GRAB CPNG STNE PAGS VIST GGAL BMA PAM YPF TS TX
 """.split()
 
 PRESETS = {
-    "מסחר יומי": dict(dry=1.10, bb="אחת מהשתיים", bbmode="בונוס", price=3.0, dv=25.0,
+    "מסחר יומי": dict(dry=1.10, bb="אחת מהשתיים", bbmode="בונוס", price=2.0, dv=8.0,
                       sh=0.0, atr=0.25, atrp=4.0, rise=12, age=(2, 20), retr=(25, 75),
                       rr=1.2, off=15, maxpx=80.0, rvol=1.5, legdv=30.0),
     "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", bbmode="בונוס", price=4.0, dv=8.0,
@@ -934,6 +934,160 @@ def core_breakdown(A, i, C):
                 spark=[float(x) for x in c[max(0, i - 59):i + 1]]), None
 
 
+def core_parabolic(A, i, C):
+    """Parabolic run, deep correction, money still parked: the second-leg setup.
+
+    This is a different animal from the ordinary pullback and cannot be
+    expressed with the same knobs. A stock that runs 300% over three months and
+    then corrects for six weeks fails core() on every axis: the leg is far
+    longer than leg_max allows, the peak is far older than age_hi allows, and
+    the retracement is measured against a base so distant that the percentages
+    stop meaning the same thing.
+
+    What defines the setup instead:
+      1. A move large enough to be a repricing, not a swing (default 60%+).
+      2. A correction deep enough to shake out the late buyers.
+      3. Price still far above where the move started — the capital that came
+         in did NOT all leave. This is the condition that separates a base for
+         a second leg from a failed pump round-tripping to zero.
+      4. Volume drying through the correction: distribution finished.
+      5. A reversal bar at the current support.
+
+    Targets run back toward the old high rather than out to new ground, because
+    the realistic first objective for a second leg is a retest of the peak."""
+    c, o, h, l, v = A["c"], A["o"], A["h"], A["l"], A["v"]
+    if i < 120:
+        return None, "היסטוריה קצרה"
+    s_ = max(0, i - C["pwin"] + 1)
+    cw, ow, hw, lw, vw = c[s_:i + 1], o[s_:i + 1], h[s_:i + 1], l[s_:i + 1], v[s_:i + 1]
+    n = len(cw)
+    if n < 120:
+        return None, "היסטוריה קצרה"
+
+    # --- locate the blow-off high inside the allowed recency band -----------
+    hi_idx = max(0, n - 1 - C["page_lo"])
+    lo_idx = max(0, n - 1 - C["page_hi"])
+    if hi_idx <= lo_idx:
+        return None, "טווח ימים לא תקין"
+    peak = lo_idx + int(np.argmax(hw[lo_idx:hi_idx]))
+    age = n - 1 - peak
+    peak_px = float(hw[peak])
+
+    # --- the base the run started from --------------------------------------
+    run_start = max(0, peak - C["prun_max"])
+    if peak - run_start < 10:
+        return None, "אין מקום לריצה"
+    base_i = run_start + int(np.argmin(lw[run_start:peak]))
+    base_px = float(lw[base_i])
+    if base_px <= 0:
+        return None, "בסיס לא תקין"
+    run_bars = peak - base_i
+    if run_bars < C["prun_min"]:
+        return None, "הריצה קצרה מדי"
+
+    rise = (peak_px / base_px - 1) * 100
+    if rise < C["prise_min"]:
+        return None, "הפריצה קטנה מדי"
+
+    px = float(cw[-1])
+    span = peak_px - base_px
+    if span <= 0:
+        return None, "אין פריצה"
+    retr = (peak_px - px) / span * 100
+    if retr < C["pretr_lo"]:
+        return None, "עוד לא תיקנה מספיק"
+    if retr > C["pretr_hi"]:
+        return None, "מחקה את כל הפריצה"
+
+    # --- did the money actually stay? ---------------------------------------
+    hold = (px / base_px - 1) * 100
+    if hold < C["phold_min"]:
+        return None, "הכסף יצא — חזרה לבסיס"
+
+    # --- volume: heavy on the run, dry on the correction --------------------
+    run_v = vw[base_i:peak + 1]
+    pull_v = vw[peak:]
+    if len(run_v) == 0 or len(pull_v) == 0 or pull_v.mean() <= 0:
+        return None, "אין נתוני נפח"
+    dry = float(run_v.mean() / pull_v.mean())
+    if dry < C["pdry_min"]:
+        return None, "הנפח לא התייבש"
+    pre = vw[max(0, base_i - 40):base_i]
+    base_v = float(pre.mean()) if len(pre) >= 5 else float(run_v.mean())
+    spike = float(run_v.max() / base_v) if base_v > 0 else 1.0
+    run_dollars = float(np.mean(run_v * cw[base_i:peak + 1]))
+    if C.get("leg_dv_min") and run_dollars < C["leg_dv_min"] * 1e6:
+        return None, "מעט כסף נכנס בזינוק"
+
+    rvol = float(v[i - 2:i + 1].mean() / v[max(0, i - 49):i + 1].mean())
+    if C.get("rvol_min") and rvol < C["rvol_min"]:
+        return None, "נפח יחסי נמוך (RVOL)"
+    if C.get("max_px") and px > C["max_px"]:
+        return None, "מחיר גבוה מדי"
+
+    a = float(A["atr"][i])
+    if not np.isfinite(a) or a <= 0:
+        return None, "אין ATR"
+    if a < C["atr_abs"]:
+        return None, "ATR נמוך מדי"
+    atr_pct = a / px * 100
+    if atr_pct < C["atr_pct"]:
+        return None, "תנודתיות נמוכה"
+
+    sup = float(lw[peak:].min())
+    off_low = (px / sup - 1) * 100 if sup > 0 else 999
+    if off_low > C["poff_max"]:
+        return None, "רחוקה מדי מהתמיכה"
+
+    is_rev, rev_name = reversal_candle(A, i)
+    if C.get("need_trig") and not is_rev:
+        return None, "אין נר היפוך"
+
+    sma200 = float(A["sma200"][i]) if np.isfinite(A["sma200"][i]) else None
+    above200 = None if sma200 is None else (px > sma200)
+    rs = None
+    if C.get("spy_ret21") is not None and i >= 21:
+        rs = (c[i] / c[i - 21] - 1) * 100 - C["spy_ret21"]
+
+    entry = max(px, float(h[i])) + .05 * a
+    stop = max(min(sup - .4 * a, entry - 3 * a), entry - 4.5 * a)
+    risk = entry - stop
+    if risk <= 0:
+        return None, "סטופ לא תקין"
+    # A second leg aims back at the old high, not at blue sky.
+    gap = peak_px - entry
+    tp1 = entry + gap * .35
+    tp2 = entry + gap * .70
+    tp3 = peak_px
+    rr = (tp1 - entry) / risk
+    if rr < C["rr_min"]:
+        return None, "אין מרווח ל-TP1"
+
+    return dict(kind="parabolic", dry=round(dry, 2), spike=round(spike, 2),
+                rise=round(rise, 1), leg_bars=int(run_bars),
+                retrace=round(retr, 1), price=round(px, 2),
+                entry=round(entry, 2), stop=round(stop, 2), tp1=round(tp1, 2),
+                tp2=round(tp2, 2), tp3=round(tp3, 2), rr=round(float(rr), 2),
+                rr3=round(float((tp3 - entry) / risk), 2),
+                risk_share=round(float(risk), 2),
+                to_entry=round((entry / px - 1) * 100, 2), rvol=round(rvol, 2),
+                atr=round(a, 2), atr_pct=round(atr_pct, 1), age=int(age),
+                support=round(sup, 2), peak_px=round(peak_px, 2),
+                base=round(base_px, 2), hold_pct=round(hold, 1),
+                leg_dollars=round(run_dollars, 0),
+                off_low=round(off_low, 1), above200=above200,
+                rs=(round(rs, 1) if rs is not None else None),
+                candle=rev_name, is_rev=bool(is_rev), bb=[],
+                spark=[float(x) for x in c[max(0, i - 119):i + 1]]), None
+
+
+def why_parabolic(r):
+    return (f"זינקה {r['rise']:.0f}% ב-{r['leg_bars']} ימים, תיקנה "
+            f"{r['retrace']:.0f}% מהמהלך בנפח קטן פי {r['dry']:.2f}, "
+            f"ועדיין {r['hold_pct']:.0f}% מעל הבסיס — הכסף לא יצא. "
+            f"יעד אחרון: חזרה לשיא ב-{r['peak_px']:.2f}")
+
+
 def why_breakdown(r):
     return (f"שברה תמיכה ב-{r['brk_pct']:.1f}% בנפח פי {r['spike']:.1f}, "
             f"תפסה אותה מחדש (עכשיו {r['reclaim_pct']:+.1f}% מעליה), "
@@ -955,7 +1109,7 @@ def spy_return_lookup(spy_df):
 
 
 def backtest_walk(d, C, CB, ptype, spy_ret_series, hold=25, cooldown=10,
-                  slip_bps=5.0, commission=0.005):
+                  slip_bps=5.0, commission=0.005, CPX=None):
     """Walk a single ticker's full history bar by bar, calling the SAME core()/
     core_breakdown() the live scanner uses — so a backtest 'pass' means exactly
     what a live match means, nothing reimplemented separately."""
@@ -977,11 +1131,15 @@ def backtest_walk(d, C, CB, ptype, spy_ret_series, hold=25, cooldown=10,
                 spy_r21 = None
         Ci = dict(C, spy_ret21=spy_r21)
         found = None
-        if ptype in ("זינוק ותיקון לתמיכה", "שתי התבניות"):
+        if ptype in ("זינוק ותיקון לתמיכה", "כל התבניות"):
             r, _ = core(A, i, Ci)
             if r is not None:
                 found = r
-        if found is None and ptype in ("שבירת תמיכה ותפיסה מחדש", "שתי התבניות"):
+        if found is None and ptype in ("פריצה פרבולית ותיקון", "כל התבניות") and CPX:
+            rp, _ = core_parabolic(A, i, dict(CPX, spy_ret21=spy_r21))
+            if rp is not None:
+                found = rp
+        if found is None and ptype in ("שבירת תמיכה ותפיסה מחדש", "כל התבניות"):
             CBi = dict(CB, spy_ret21=spy_r21)
             rb, _ = core_breakdown(A, i, CBi)
             if rb is not None:
@@ -1047,6 +1205,21 @@ def rank_verdict(r):
     differences don't decide the ranking; age (ascending, fresher first) does instead.
     """
     age = r.get("age", 0)
+    if r.get("kind") == "parabolic":
+        hold = r.get("hold_pct", 0)
+        rise = r.get("rise", 0)
+        # Ranked by how much of the original move is still held, because that
+        # is the whole thesis: capital that stayed in is what funds a second
+        # leg. Not backtested — flagged honestly as experimental.
+        return dict(tier="P", color="#4E8FB0", sort=(1, -hold / 100, age),
+                    headline=f"פריצה {rise:.0f}% · מחזיקה {hold:.0f}% מעל הבסיס",
+                    detail=f"המנייה עשתה מהלך של {rise:.0f}% ותיקנה "
+                           f"{r.get('retrace', 0):.0f}% ממנו, אבל היא עדיין "
+                           f"{hold:.0f}% מעל הנקודה שממנה יצאה — כלומר רוב הכסף "
+                           f"שנכנס במהלך עוד שם. זה ההבדל בין בסיס לרגל שני לבין "
+                           f"פאמפ שחוזר לאפס. חשוב: התבנית הזאת לא עברה בדיקה "
+                           f"היסטורית במערכת, בניגוד ליובש הנפח. היא הגיונית "
+                           f"טכנית — אין לה עדיין הוכחה סטטיסטית.")
     if r.get("kind") == "breakdown":
         return dict(tier="?", color="#8A6FB0", sort=(2, 0, age),
                     headline="לא נבדק היסטורית",
@@ -1088,7 +1261,18 @@ def explain_ai(r, rank=None, total=None):
     reclaim_txt = ltr(f"{r.get('reclaim_pct', 0):+.1f}%")
     to_entry_txt = ltr(f"{r['to_entry']:+.1f}%")
 
-    if r.get("kind") == "breakdown":
+    if r.get("kind") == "parabolic":
+        parts.append(
+            f"{r['ticker']} עשתה מהלך של {r['rise']:.0f}% מ-{r['base']:.2f} "
+            f"עד {r['peak_px']:.2f} על פני {r['leg_bars']} ימי מסחר, ואז תיקנה "
+            f"{r['retrace']:.0f}% מהמהלך בנפח שהתייבש פי {r['dry']:.2f}. "
+            f"הנתון המכריע כאן: היא נסחרת עכשיו {r['hold_pct']:.0f}% מעל הבסיס "
+            f"שממנו יצאה. כלומר רוב הכסף שנכנס במהלך לא יצא — מי שקנה מוקדם "
+            f"עדיין ברווח ואין לו סיבה לברוח, ומי שקנה בשיא כבר נשטף. "
+            f"זו ההגדרה של בסיס לרגל שני, להבדיל מפאמפ שמתרוקן. "
+            f"היעד האחרון הוא חזרה לשיא ב-{r['peak_px']:.2f}, לא שטח חדש. "
+            f"התבנית הזאת לא נבדקה היסטורית במערכת — התייחס בזהירות.")
+    elif r.get("kind") == "breakdown":
         parts.append(
             f"{r['ticker']} שברה תמיכה שנקבעה על פני כחודש בשיעור של {r['brk_pct']:.1f}%, "
             f"בנפח שהגיע לפי {r['spike']:.1f} מהרגיל, ואז תפסה אותה מחדש — כרגע נסחרת "
@@ -1151,7 +1335,10 @@ def explain_ai(r, rank=None, total=None):
         f"יחס סיכון-סיכוי ליעד הראשון: 1:{r['rr']:.1f}. נקודת הכניסה נמצאת "
         f"{to_entry_txt} מהמחיר הנוכחי — {wait_txt}.")
 
-    if r.get("kind") == "breakdown":
+    if r.get("kind") == "parabolic":
+        bottom = ("שורה תחתונה: מבנה קלאסי לרגל שני, אך ניסיוני — "
+                  "הכסף עוד בפנים, וזה התנאי המרכזי. גודל פוזיציה מוקטן.")
+    elif r.get("kind") == "breakdown":
         bottom = "שורה תחתונה: תבנית טכנית הגיונית אך ניסיונית — הזדמנות משנית, לא ראשית."
     elif r.get("tier") == "A":
         bottom = "שורה תחתונה: אחת ההזדמנויות המבוססות ביותר שהמערכת מצאה בסריקה הזאת."
@@ -1250,6 +1437,24 @@ def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, 
     if r.get("eh_triggered"):
         badges += ('<span class="badge" style="background:rgba(212,166,75,.2);'
                    'color:var(--gd)">פרץ במסחר מורחב</span>')
+    if r.get("kind") == "parabolic":
+        badges = ('<span class="badge" style="background:rgba(78,143,176,.18);'
+                  'color:#6FB2D9">פרבולי · רגל שני</span>') + badges
+        head_val, head_lab = f"+{r['rise']:.0f}%", "גודל הפריצה"
+        sub_lab, sub_val = "מעל הבסיס", f"{r.get('hold_pct', 0):.0f}%"
+        badge_row = f'<div class="badges">{badges}</div>' if badges else ""
+        return f"""<div class="tc{' top' if best else ''}{' near' if near and not triggered else ''}">
+<div class="tc-h"><div style="display:flex;align-items:baseline;gap:.5rem">
+{rank_html}<div class="tc-s">{r['ticker']}</div>
+<span class="tierchip" style="background:{tcolor}22;color:{tcolor};border:1px solid {tcolor}55">רמה {tier}</span>
+</div><div class="tc-d"><b>{head_val}</b><span>{head_lab}</span></div></div>
+<div class="verdict-line" style="color:{tcolor}">{vheadline}</div>
+{sparkline(r.get('spark', []))}{badge_row}<div class="chips">{ch}</div>{ladder(r)}
+<div class="tl"><span>{int(r['shares'])} מניות · סיכון <b>${r['risk_total']:.0f}</b></span>
+<span>יחס <b>1:{r['rr']:.1f}</b></span></div>
+<div class="tl" style="border:0;padding-top:.22rem"><span>{sub_lab}: {sub_val}</span>
+<span>הפעלה ב-<b>{ltr(f"{r['to_entry']:+.1f}%")}</b></span></div>
+<div class="tw">{r['why']}</div></div>"""
     is_bd = r.get("kind") == "breakdown"
     if is_bd:
         badges = ('<span class="badge" style="background:rgba(138,111,176,.16);'
@@ -1520,8 +1725,13 @@ if fresh:
     clear_price_cache()
     go_ = True
 
-ptype = st.radio("סוג תבנית", ["זינוק ותיקון לתמיכה", "שבירת תמיכה ותפיסה מחדש", "שתי התבניות"],
-                 horizontal=True)
+ptype = st.radio("סוג תבנית",
+                 ["זינוק ותיקון לתמיכה", "פריצה פרבולית ותיקון",
+                  "שבירת תמיכה ותפיסה מחדש", "כל התבניות"],
+                 horizontal=True,
+                 help="'פריצה פרבולית ותיקון' מחפש מניות שעשו מהלך עצום, "
+                      "תיקנו עמוק, ועדיין רחוק מעל הנקודה שממנה יצאו — "
+                      "כלומר הכסף שנכנס לא יצא. זה הרגל השני.")
 
 with st.expander("סינון מתקדם"):
     st.markdown("##### זינוק ותיקון")
@@ -1540,6 +1750,28 @@ with st.expander("סינון מתקדם"):
     win = w1.slider("חלון היסטוריה (ימים)", 100, 250, 150, 10,
                     help="רקע היסטורי לחישוב נפח בסיס. השיא עצמו נחפש רק בטווח "
                          "'ימים מהשיא' שהגדרת למעלה — לא כאן.")
+
+    st.markdown("##### פריצה פרבולית ותיקון")
+    y1, y2, y3, y4 = st.columns(4)
+    prise_min = y1.slider("גודל הפריצה מינ׳ %", 20, 500, 60, 10,
+                          help="כמה המנייה עלתה מהבסיס לשיא. 60% = מהלך רציני. "
+                               "200% = פרבולי אמיתי כמו שתיארת.")
+    pretr = y2.slider("עומק התיקון %", 10, 90, (30, 70),
+                      help="כמה מהמהלך הוחזר. 30-70 = תיקון בריא שמנער "
+                           "את מי שקנה מאוחר, בלי למחוק את המהלך.")
+    phold_min = y3.slider("מעל הבסיס מינ׳ %", 5, 300, 25, 5,
+                          help="התנאי הכי חשוב בתבנית הזאת: כמה אחוז המחיר "
+                               "עדיין מעל הנקודה שממנה יצא המהלך. אם ירד "
+                               "מתחת לזה — הכסף יצא וזו לא הזדמנות לרגל שני.")
+    page = y4.slider("ימים מהשיא", 3, 120, (5, 60),
+                     help="כמה זמן עבר מאז השיא. תיקון של מהלך גדול "
+                          "לוקח שבועות, לא ימים.")
+    y5, y6, y7, y8 = st.columns(4)
+    prun_min = y5.slider("ימי ריצה מינ׳", 5, 60, 10)
+    prun_max = y6.slider("ימי ריצה מקס׳", 20, 200, 120, 10,
+                         help="חלון החיפוש אחורה מהשיא אל הבסיס.")
+    pdry_min = y7.number_input("יובש נפח מינ׳ (פרבולי)", 0.8, 5.0, 1.15, 0.05)
+    poff_max = y8.slider("מרחק מקס׳ מתמיכה %", 3, 50, 20)
 
     st.markdown("##### שבירת תמיכה ותפיסה מחדש")
     n1, n2, n3, n4 = st.columns(4)
@@ -1561,7 +1793,7 @@ with st.expander("סינון מתקדם"):
     bb_look = j2.slider("בולינג׳ר: ימים אחורה", 1, 10, 3)
     min_sh = j3.number_input("נפח מינ׳ (מ׳ מניות)", 0.0, 50.0, float(P.get("sh", 0.0)), 0.1,
                              help="0 מכבה. סינון לפי מספר מניות פוסל מניות יקרות ונזילות.")
-    limit = j4.slider("מספר מניות לסריקה", 100, 7000, 2500, 100,
+    limit = j4.slider("מספר מניות לסריקה", 100, 7038, 7038, 100,
                       help="הסריקה עובדת בשני שלבים: קודם 10 נרות לכל מנייה "
                            "(זול) כדי לפסול לא-נזילות, ורק אחר כך שנה שלמה "
                            "למי ששרד. לכן 2500 מניות אפשרי גם בענן החינמי. "
@@ -1621,6 +1853,13 @@ C = dict(leg_min=leg_min, leg_max=leg_max, rise_min=rise_min, retr_lo=retr[0],
          bb={"כבוי": "off", "רצועה תחתונה": "lower",
              "רצועה עליונה": "upper", "אחת מהשתיים": "both"}[bb_lbl])
 
+CP = dict(pwin=max(win, 250), prise_min=prise_min, pretr_lo=pretr[0],
+          pretr_hi=pretr[1], phold_min=phold_min, page_lo=page[0], page_hi=page[1],
+          prun_min=prun_min, prun_max=prun_max, pdry_min=pdry_min,
+          poff_max=poff_max, atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min,
+          need_trig=rev_hard, rvol_min=(rvol_min or None), max_px=(max_px or None),
+          leg_dv_min=(leg_dv_min or None))
+
 CB = dict(win=win, sup_win=sup_win, break_win=break_win, break_min=break_min,
           break_max=break_max, reclaim_lo=reclaim_lo, reclaim_hi=reclaim_hi,
           atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min, need_trig=need_trig_b,
@@ -1667,7 +1906,8 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
                     if float(dd["Close"].iloc[-1] * dd["Volume"].tail(20).mean()) < min_dv * 1e6:
                         continue
                     for tr in backtest_walk(dd, C, CB, ptype, spy_series, hold=bt_hold,
-                                            slip_bps=bt_slip, commission=bt_comm):
+                                            slip_bps=bt_slip, commission=bt_comm,
+                                            CPX=CP):
                         tr["ticker"] = t
                         trades.append(tr)
                 except Exception:
@@ -2139,7 +2379,7 @@ if go_:
                 last_bar = d.index[-1]
             A = prep(d)
             found_here = []
-            if ptype in ("זינוק ותיקון לתמיכה", "שתי התבניות"):
+            if ptype in ("זינוק ותיקון לתמיכה", "כל התבניות"):
                 r, why = core(A, len(A["c"]) - 1, C)
                 if r is None:
                     drop[why] = drop.get(why, 0) + 1
@@ -2147,7 +2387,15 @@ if go_:
                     r["kind"] = "pullback"
                     r["why"] = why_he(r)
                     found_here.append(r)
-            if ptype in ("שבירת תמיכה ותפיסה מחדש", "שתי התבניות"):
+            if ptype in ("פריצה פרבולית ותיקון", "כל התבניות"):
+                CP["spy_ret21"] = C.get("spy_ret21")
+                rp, whyp = core_parabolic(A, len(A["c"]) - 1, CP)
+                if rp is None:
+                    drop["פרבולי: " + whyp] = drop.get("פרבולי: " + whyp, 0) + 1
+                else:
+                    rp["why"] = why_parabolic(rp)
+                    found_here.append(rp)
+            if ptype in ("שבירת תמיכה ותפיסה מחדש", "כל התבניות"):
                 rb, whyb = core_breakdown(A, len(A["c"]) - 1, CB)
                 if rb is None:
                     drop["שבירה: " + whyb] = drop.get("שבירה: " + whyb, 0) + 1
@@ -2183,6 +2431,64 @@ if go_:
             kept.append(r)
         rows = kept
         note2.empty()
+    # ---- near-miss pass -------------------------------------------------
+    # When the scan comes back empty the funnel says WHICH filter blocked the
+    # most names, but not how close any single stock actually was. Re-running
+    # the same cores against the already-downloaded data with each numeric
+    # threshold widened costs nothing on the network and answers the real
+    # question: "was anything one hair away, or is today simply not the day?"
+    near_rows = []
+    if not rows and market:
+        C_soft = dict(C)
+        C_soft.update(rise_min=max(C["rise_min"] * 0.5, 4),
+                      retr_lo=max(C["retr_lo"] - 12, 5),
+                      retr_hi=min(C["retr_hi"] + 12, 92),
+                      dry_min=max(C["dry_min"] - 0.25, 1.0),
+                      atr_pct=max(C["atr_pct"] - 1.5, 0.5),
+                      rvol_min=(max(C["rvol_min"] - 0.4, 0.8)
+                                if C.get("rvol_min") else None),
+                      leg_dv_min=(C["leg_dv_min"] * 0.5
+                                  if C.get("leg_dv_min") else None),
+                      off_max=C["off_max"] + 6,
+                      rev_hard=False, trend_hard=False, bb_hard=False)
+        for t, d in market.items():
+            try:
+                A = prep(d)
+                rs_, _ = core(A, len(A["c"]) - 1, C_soft)
+                if rs_ is None:
+                    continue
+                # Record exactly which of the user's real thresholds it misses.
+                misses = []
+                if rs_["rise"] < C["rise_min"]:
+                    misses.append(f"זינוק {rs_['rise']:.0f}% מול {C['rise_min']}% נדרש")
+                if rs_["retrace"] < C["retr_lo"]:
+                    misses.append(f"תיקון {rs_['retrace']:.0f}% מול {C['retr_lo']}% נדרש")
+                if rs_["retrace"] > C["retr_hi"]:
+                    misses.append(f"תיקון {rs_['retrace']:.0f}% מעל {C['retr_hi']}% מותר")
+                if rs_["dry"] < C["dry_min"]:
+                    misses.append(f"יובש {rs_['dry']:.2f}× מול {C['dry_min']:.2f}× נדרש")
+                if rs_["atr_pct"] < C["atr_pct"]:
+                    misses.append(f"ATR {rs_['atr_pct']:.1f}% מול {C['atr_pct']}% נדרש")
+                if C.get("rvol_min") and rs_["rvol"] < C["rvol_min"]:
+                    misses.append(f"RVOL {rs_['rvol']:.2f} מול {C['rvol_min']:.2f} נדרש")
+                if C.get("leg_dv_min") and rs_.get("leg_dollars", 0) < C["leg_dv_min"] * 1e6:
+                    misses.append(f"${rs_['leg_dollars']/1e6:.0f}מ׳ בזינוק מול "
+                                  f"${C['leg_dv_min']:.0f}מ׳ נדרש")
+                if not rs_.get("is_rev"):
+                    misses.append("אין נר היפוך")
+                if rs_.get("above200") is False:
+                    misses.append("מתחת ל-SMA200")
+                if not misses or len(misses) > 2:
+                    continue  # only genuinely close calls are useful
+                rs_["ticker"] = t
+                rs_["misses"] = misses
+                rs_["n_miss"] = len(misses)
+                near_rows.append(rs_)
+            except Exception:
+                pass
+        near_rows.sort(key=lambda x: (x["n_miss"], -x["rise"]))
+        near_rows = near_rows[:25]
+
     for r in rows:
         v_ = rank_verdict(r)
         r["tier"], r["tier_color"] = v_["tier"], v_["color"]
@@ -2208,7 +2514,8 @@ if go_:
                     r["eh_triggered"] = True
         note3.empty()
     st.session_state.update(
-        rows=rows, stats=(len(uni), liq), got_data=len(market), drop=drop, open=None,
+        rows=rows, near=near_rows, stats=(len(uni), liq),
+        got_data=len(market), drop=drop, open=None,
         scanned_at=datetime.now(il).strftime("%H:%M"),
         took=round(time.time() - t0, 1), cached=not fresh,
         data_date=last_bar.strftime("%d.%m.%y") if last_bar is not None else "—")
@@ -2282,6 +2589,44 @@ else:
             "חלשה מדי מול השוק": "בטל את 'דרוש חוזק מול השוק'.",
             "היסטוריה קצרה": "נורמלי — מניות שנסחרות פחות מ-80 ימים לא ניתנות לניתוח.",
         }
+        near = st.session_state.get("near") or []
+        if near:
+            st.markdown("#### כמעט התאימו — ובכמה בדיוק פספסו")
+            st.caption("המניות האלה עברו את כל שאר התנאים. לכל אחת רשום מה חסר "
+                       "ומה הערך שלה בפועל, כדי שתדע אם שווה להזיז סליידר או שזה "
+                       "באמת לא היום. חושב על הנתונים שכבר ירדו — בלי הורדה נוספת.")
+            near_tbl = pd.DataFrame([{
+                "מניה": x["ticker"],
+                "מחיר": x["price"],
+                "זינוק %": x["rise"],
+                "תיקון %": x["retrace"],
+                "יובש": x["dry"],
+                "RVOL": x["rvol"],
+                "ATR %": x["atr_pct"],
+                "$מ׳ בזינוק": round(x.get("leg_dollars", 0) / 1e6, 1),
+                "מה חסר": " · ".join(x["misses"]),
+            } for x in near])
+            st.dataframe(near_tbl, hide_index=True, use_container_width=True,
+                         height=min(420, 40 + 35 * len(near)),
+                         column_config={
+                             "מחיר": st.column_config.NumberColumn(format="$%.2f"),
+                             "זינוק %": st.column_config.NumberColumn(format="%.0f%%"),
+                             "תיקון %": st.column_config.NumberColumn(format="%.0f%%"),
+                             "יובש": st.column_config.NumberColumn(format="%.2f×"),
+                             "RVOL": st.column_config.NumberColumn(format="%.2f"),
+                             "ATR %": st.column_config.NumberColumn(format="%.1f%%")})
+            one_miss = [x for x in near if x["n_miss"] == 1]
+            if one_miss:
+                from collections import Counter
+                top_single = Counter(x["misses"][0].split(" ")[0]
+                                     for x in one_miss).most_common(1)[0]
+                st.markdown(
+                    f'<div class="blocker">{len(one_miss)} מניות פספסו תנאי '
+                    f'<b>אחד בלבד</b>. הנפוץ ביותר ביניהן: <b>{top_single[0]}</b> '
+                    f'({top_single[1]} מניות). הזזת הסליידר הזה היא השינוי '
+                    f'היחיד שיפתח אותן.</div>', unsafe_allow_html=True)
+            st.markdown("---")
+
         dsorted = sorted(st.session_state["drop"].items(), key=lambda x: -x[1])[:3]
         if dsorted:
             st.markdown("#### מה לעשות עכשיו")
@@ -2343,7 +2688,8 @@ else:
             t = pd.DataFrame([{
                 "#": r["_rank"],
                 "מניה": r["ticker"],
-                "סוג": "שבירה" if r.get("kind") == "breakdown" else "תיקון",
+                "סוג": {"breakdown": "שבירה", "parabolic": "פרבולי"}.get(
+                    r.get("kind"), "תיקון"),
                 "יובש/שבירה": r["dry"], "מחיר": r["price"],
                 "כניסה": r["entry"], "% לכניסה": r["to_entry"], "סטופ": r["stop"],
                 "TP1": r["tp1"], "TP2": r["tp2"], "TP3": r["tp3"], "R:R": r["rr"],

@@ -231,6 +231,9 @@ PRESETS = {
                        rr=1.5, off=12),
     "רחב": dict(dry=1.05, bb="אחת מהשתיים", bbmode="בונוס", price=5.0, dv=8.0, sh=0.2,
                 atr=0.4, atrp=1.5, rise=6, age=(2, 35), retr=(12, 88), rr=1.0, off=20),
+    "מסחר יומי": dict(dry=1.10, bb="אחת מהשתיים", bbmode="בונוס", price=3.0, dv=25.0,
+                      sh=0.0, atr=0.25, atrp=4.0, rise=12, age=(2, 20), retr=(25, 75),
+                      rr=1.2, off=15, maxpx=80.0, rvol=1.5, legdv=30.0),
     "מחמיר": dict(dry=1.45, bb="רצועה תחתונה", bbmode="חובה", price=15.0, dv=40.0, sh=1.0,
                   atr=1.5, atrp=3.0, rise=20, age=(3, 15), retr=(30, 65), rr=2.0, off=8),
 }
@@ -651,6 +654,17 @@ def core(A, i, C):
     if base_v <= 0 or len(leg_v) == 0 or len(pull_v) == 0 or pull_v.mean() <= 0:
         return None, "אין נתוני נפח"
     spike = float(leg_v.max() / base_v)
+
+    # --- "כמה כסף נכנס בזינוק" -------------------------------------------
+    # Volume ratios alone say nothing about whether real money moved: a stock
+    # that trades 80k shares a day can post a 5x volume spike and still be a
+    # $400k day that no day trader can work with. This measures the average
+    # DOLLAR volume across the up-leg itself, so the filter can demand actual
+    # capital inflow during the move rather than a ratio against a tiny base.
+    leg_px = cw[low_i:peak + 1]
+    leg_dollars = float(np.mean(leg_v * leg_px)) if len(leg_px) == len(leg_v) else 0.0
+    if C.get("leg_dv_min") and leg_dollars < C["leg_dv_min"] * 1e6:
+        return None, "מעט כסף נכנס בזינוק"
     dry = float(leg_v.mean() / pull_v.mean())
     if dry < C["dry_min"]:
         return None, "הנפח לא התייבש"
@@ -672,6 +686,13 @@ def core(A, i, C):
     if atr_pct < C["atr_pct"]:
         return None, "תנודתיות נמוכה"
     rvol = float(v[i - 2:i + 1].mean() / v[max(0, i - 49):i + 1].mean())
+    # A name trading at half its normal volume is not waking up, whatever the
+    # chart shape looks like. This is the filter that keeps sleepy large caps
+    # out of a day-trading list.
+    if C.get("rvol_min") and rvol < C["rvol_min"]:
+        return None, "נפח יחסי נמוך (RVOL)"
+    if C.get("max_px") and px > C["max_px"]:
+        return None, "מחיר גבוה מדי"
     sma200 = float(A["sma200"][i]) if np.isfinite(A["sma200"][i]) else None
     above200 = None if sma200 is None else (px > sma200)
     if C.get("trend_hard") and sma200 is not None and not above200:
@@ -703,6 +724,7 @@ def core(A, i, C):
                 to_entry=round((entry / px - 1) * 100, 2), rvol=round(rvol, 2),
                 atr=round(a, 2), atr_pct=round(atr_pct, 1), age=int(age),
                 support=round(sup, 2), peak_px=round(pk_px, 2), base=round(lo_px, 2),
+                leg_dollars=round(leg_dollars, 0),
                 off_low=round(off_low, 1), above200=above200,
                 rs=(round(rs, 1) if rs is not None else None),
                 candle=rev_name, is_rev=bool(is_rev),
@@ -850,6 +872,10 @@ def core_breakdown(A, i, C):
     brk_spike = float(np.max(brk_v) / base_v)
 
     rvol = float(v[i - 2:i + 1].mean() / v[max(0, i - 49):i + 1].mean())
+    if C.get("rvol_min") and rvol < C["rvol_min"]:
+        return None, "נפח יחסי נמוך (RVOL)"
+    if C.get("max_px") and px > C["max_px"]:
+        return None, "מחיר גבוה מדי"
     a = float(A["atr"][i])
     if not np.isfinite(a) or a <= 0:
         return None, "אין ATR"
@@ -1181,7 +1207,12 @@ def card(r, best=False, watched=False, triggered=False, aging=False, rank=None, 
     if _cand and _cand != "אין נר היפוך":
         ch += f'<span class="chip g">🕯 {_cand}</span>'
     ch += "".join(f'<span class="chip g">בולינג׳ר {b}</span>' for b in r.get("bb", []))
-    ch += f'<span class="chip">ATR {r["atr"]:.2f}$ · RVOL {r["rvol"]:.2f}</span>'
+    _rv = r.get("rvol", 0)
+    _rvcls = "g" if _rv >= 1.5 else ""
+    ch += f'<span class="chip {_rvcls}">RVOL {_rv:.2f}</span>'
+    ch += f'<span class="chip">ATR {r["atr"]:.2f}$ ({r.get("atr_pct", 0):.1f}%)</span>'
+    if r.get("leg_dollars"):
+        ch += f'<span class="chip g">${r["leg_dollars"]/1e6:.0f}מ׳ בזינוק</span>'
     if r.get("rs") is not None:
         ch += f'<span class="chip">RS {r["rs"]:+.1f}%</span>'
     near = r["to_entry"] <= 1.0
@@ -1463,8 +1494,8 @@ _ = wl_load()  # ensure state hydrated from URL before anything renders
 if "P" not in st.session_state:
     st.session_state["P"] = dict(PRESETS["התבנית שלי"])
 
-p1, p2, p3, p4 = st.columns([1, 1, 1, 3])
-for col, name in zip((p1, p2, p3), PRESETS):
+p1, p2, p3, p4, p5 = st.columns([1, 1, 1, 1, 2])
+for col, name in zip((p1, p2, p3, p4), PRESETS):
     if col.button(name, use_container_width=True, key=f"ps{name}"):
         st.session_state["P"] = dict(PRESETS[name])
         st.rerun()
@@ -1549,6 +1580,23 @@ with st.expander("סינון מתקדם"):
                                 help="0 = כבוי (מהיר). כל ערך אחר מוסיף קריאת רשת "
                                      "לכל מנייה שנמצאה, ומאט את סוף הסריקה בכמה שניות.")
 
+    st.markdown("##### תנועה ונפח — מה הופך מנייה לסחירה ביום")
+    d1, d2, d3, d4 = st.columns(4)
+    max_px = d1.number_input("מחיר מקס׳ $", 0.0, 2000.0, float(P.get("maxpx", 0.0)), 5.0,
+                             help="0 = ללא הגבלה. מניה ב-400$ דורשת הון גדול לכל "
+                                  "פוזיציה ומגיבה לאט. למסחר יומי נסה 20–80.")
+    rvol_min = d2.number_input("RVOL מינ׳", 0.0, 10.0, float(P.get("rvol", 0.0)), 0.1,
+                               help="נפח 3 הימים האחרונים חלקי הממוצע של 50 יום. "
+                                    "1.0 = נפח רגיל. מתחת ל-1 המנייה ישנה. "
+                                    "למסחר יומי דרוש 1.5 ומעלה.")
+    leg_dv_min = d3.number_input("כסף בזינוק מינ׳ (מ׳ $)", 0.0, 500.0,
+                                 float(P.get("legdv", 0.0)), 1.0,
+                                 help="ממוצע המחזור הדולרי בימי העלייה עצמם. "
+                                      "זה 'כמה כסף נכנס'. יחס נפח גבוה על מנייה "
+                                      "דלילה עדיין אומר מעט מאוד כסף אמיתי.")
+    d4.markdown("<div style='height:1.55rem'></div>", unsafe_allow_html=True)
+    d4.caption("שלושת אלה יחד מוציאים מניות גדולות ומנומנמות.")
+
     q1, q2, q3 = st.columns(3)
     rev_hard = q1.checkbox("דרוש נר היפוך איכותי", value=True,
                            help="נר שורי עם גוף משמעותי וסגירה בחלק העליון, פטיש, "
@@ -1568,13 +1616,16 @@ C = dict(leg_min=leg_min, leg_max=leg_max, rise_min=rise_min, retr_lo=retr[0],
          off_max=off_max, bb_hard=(bbmode == "חובה"), trend_hard=trend_hard,
          rev_hard=rev_hard,
          rs_min=(rs_min_val if use_rs else None),
+         rvol_min=(rvol_min or None), max_px=(max_px or None),
+         leg_dv_min=(leg_dv_min or None),
          bb={"כבוי": "off", "רצועה תחתונה": "lower",
              "רצועה עליונה": "upper", "אחת מהשתיים": "both"}[bb_lbl])
 
 CB = dict(win=win, sup_win=sup_win, break_win=break_win, break_min=break_min,
           break_max=break_max, reclaim_lo=reclaim_lo, reclaim_hi=reclaim_hi,
           atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min, need_trig=need_trig_b,
-          trend_hard=trend_hard, rs_min=(rs_min_val if use_rs else None))
+          trend_hard=trend_hard, rs_min=(rs_min_val if use_rs else None),
+          rvol_min=(rvol_min or None), max_px=(max_px or None))
 
 with st.expander("בדיקה היסטורית — לפני שסומכים על סינון חדש"):
     st.markdown("בודק כל איתות היסטורי שהמסננים שלמעלה היו מזהים, ועוקב קדימה: "

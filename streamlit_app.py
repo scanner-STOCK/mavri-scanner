@@ -226,14 +226,14 @@ SE MELI GRAB CPNG STNE PAGS VIST GGAL BMA PAM YPF TS TX
 """.split()
 
 PRESETS = {
+    "מסחר יומי": dict(dry=1.10, bb="אחת מהשתיים", bbmode="בונוס", price=3.0, dv=25.0,
+                      sh=0.0, atr=0.25, atrp=4.0, rise=12, age=(2, 20), retr=(25, 75),
+                      rr=1.2, off=15, maxpx=80.0, rvol=1.5, legdv=30.0),
     "התבנית שלי": dict(dry=1.30, bb="רצועה תחתונה", bbmode="בונוס", price=4.0, dv=8.0,
                        sh=0.0, atr=0.5, atrp=2.0, rise=8, age=(3, 45), retr=(20, 70),
                        rr=1.5, off=12),
     "רחב": dict(dry=1.05, bb="אחת מהשתיים", bbmode="בונוס", price=5.0, dv=8.0, sh=0.2,
                 atr=0.4, atrp=1.5, rise=6, age=(2, 35), retr=(12, 88), rr=1.0, off=20),
-    "מסחר יומי": dict(dry=1.10, bb="אחת מהשתיים", bbmode="בונוס", price=3.0, dv=25.0,
-                      sh=0.0, atr=0.25, atrp=4.0, rise=12, age=(2, 20), retr=(25, 75),
-                      rr=1.2, off=15, maxpx=80.0, rvol=1.5, legdv=30.0),
     "מחמיר": dict(dry=1.45, bb="רצועה תחתונה", bbmode="חובה", price=15.0, dv=40.0, sh=1.0,
                   atr=1.5, atrp=3.0, rise=20, age=(3, 15), retr=(30, 65), rr=2.0, off=8),
 }
@@ -1492,7 +1492,7 @@ st.markdown(f"""<div class="bar">
 _ = wl_load()  # ensure state hydrated from URL before anything renders
 
 if "P" not in st.session_state:
-    st.session_state["P"] = dict(PRESETS["התבנית שלי"])
+    st.session_state["P"] = dict(PRESETS["מסחר יומי"])
 
 p1, p2, p3, p4, p5 = st.columns([1, 1, 1, 1, 2])
 for col, name in zip((p1, p2, p3, p4), PRESETS):

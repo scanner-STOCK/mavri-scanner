@@ -956,12 +956,15 @@ def core_parabolic(A, i, C):
     Targets run back toward the old high rather than out to new ground, because
     the realistic first objective for a second leg is a retest of the peak."""
     c, o, h, l, v = A["c"], A["o"], A["h"], A["l"], A["v"]
-    if i < 120:
+    # 90 bars, not 120: a stock that IPO'd nine months ago and then ran 300%
+    # is a prime candidate for this pattern, and the stricter floor excluded
+    # exactly that profile.
+    if i < 90:
         return None, "היסטוריה קצרה"
     s_ = max(0, i - C["pwin"] + 1)
     cw, ow, hw, lw, vw = c[s_:i + 1], o[s_:i + 1], h[s_:i + 1], l[s_:i + 1], v[s_:i + 1]
     n = len(cw)
-    if n < 120:
+    if n < 90:
         return None, "היסטוריה קצרה"
 
     # --- locate the blow-off high inside the allowed recency band -----------
@@ -1016,13 +1019,20 @@ def core_parabolic(A, i, C):
     base_v = float(pre.mean()) if len(pre) >= 5 else float(run_v.mean())
     spike = float(run_v.max() / base_v) if base_v > 0 else 1.0
     run_dollars = float(np.mean(run_v * cw[base_i:peak + 1]))
-    if C.get("leg_dv_min") and run_dollars < C["leg_dv_min"] * 1e6:
-        return None, "מעט כסף נכנס בזינוק"
+    if C.get("pdv_min") and run_dollars < C["pdv_min"] * 1e6:
+        return None, "מעט כסף נכנס בפריצה"
 
+    # Independent gates. A parabolic runner is usually a sub-$5 micro-cap, and
+    # during its correction the relative volume often falls BELOW normal — the
+    # day-trading floors (price >= $2, RVOL >= 1.5) would reject exactly the
+    # names this pattern exists to find. So it carries its own thresholds and
+    # ignores the day-trading ones entirely.
     rvol = float(v[i - 2:i + 1].mean() / v[max(0, i - 49):i + 1].mean())
-    if C.get("rvol_min") and rvol < C["rvol_min"]:
+    if C.get("prvol_min") and rvol < C["prvol_min"]:
         return None, "נפח יחסי נמוך (RVOL)"
-    if C.get("max_px") and px > C["max_px"]:
+    if C.get("pmin_px") and px < C["pmin_px"]:
+        return None, "מחיר נמוך"
+    if C.get("pmax_px") and px > C["pmax_px"]:
         return None, "מחיר גבוה מדי"
 
     a = float(A["atr"][i])
@@ -1050,7 +1060,16 @@ def core_parabolic(A, i, C):
         rs = (c[i] / c[i - 21] - 1) * 100 - C["spy_ret21"]
 
     entry = max(px, float(h[i])) + .05 * a
-    stop = max(min(sup - .4 * a, entry - 3 * a), entry - 4.5 * a)
+    # Structural stop, NOT an ATR multiple. On a name that just ran 300% the
+    # ATR is enormous, and "entry - 3*ATR" put the stop ~75% below entry —
+    # inflating risk until the R:R test rejected every real candidate. The
+    # swing low since the peak is the level that actually invalidates the
+    # setup; ATR only pads it slightly. A hard risk ceiling keeps the position
+    # sizeable even when the support sits far away.
+    stop = sup - .25 * a
+    max_risk = entry * (C.get("pmax_risk", 25) / 100.0)
+    if entry - stop > max_risk:
+        stop = entry - max_risk
     risk = entry - stop
     if risk <= 0:
         return None, "סטופ לא תקין"
@@ -1756,22 +1775,47 @@ with st.expander("סינון מתקדם"):
     prise_min = y1.slider("גודל הפריצה מינ׳ %", 20, 500, 60, 10,
                           help="כמה המנייה עלתה מהבסיס לשיא. 60% = מהלך רציני. "
                                "200% = פרבולי אמיתי כמו שתיארת.")
-    pretr = y2.slider("עומק התיקון %", 10, 90, (30, 70),
+    pretr = y2.slider("עומק התיקון %", 5, 95, (25, 80),
                       help="כמה מהמהלך הוחזר. 30-70 = תיקון בריא שמנער "
                            "את מי שקנה מאוחר, בלי למחוק את המהלך.")
     phold_min = y3.slider("מעל הבסיס מינ׳ %", 5, 300, 25, 5,
                           help="התנאי הכי חשוב בתבנית הזאת: כמה אחוז המחיר "
                                "עדיין מעל הנקודה שממנה יצא המהלך. אם ירד "
                                "מתחת לזה — הכסף יצא וזו לא הזדמנות לרגל שני.")
-    page = y4.slider("ימים מהשיא", 3, 120, (5, 60),
+    page = y4.slider("ימים מהשיא", 1, 120, (1, 45),
                      help="כמה זמן עבר מאז השיא. תיקון של מהלך גדול "
                           "לוקח שבועות, לא ימים.")
     y5, y6, y7, y8 = st.columns(4)
-    prun_min = y5.slider("ימי ריצה מינ׳", 5, 60, 10)
+    prun_min = y5.slider("ימי ריצה מינ׳", 2, 60, 3,
+                         help="DLXY עשתה 325% בחמישה ימים. סף של 10 ימים "
+                              "היה פוסל אותה. 3 = תופס גם ספייקים מהירים.")
     prun_max = y6.slider("ימי ריצה מקס׳", 20, 200, 120, 10,
                          help="חלון החיפוש אחורה מהשיא אל הבסיס.")
-    pdry_min = y7.number_input("יובש נפח מינ׳ (פרבולי)", 0.8, 5.0, 1.15, 0.05)
-    poff_max = y8.slider("מרחק מקס׳ מתמיכה %", 3, 50, 20)
+    pdry_min = y7.number_input("יובש נפח מינ׳ (פרבולי)", 0.5, 5.0, 1.05, 0.05)
+    poff_max = y8.slider("מרחק מקס׳ מתמיכה %", 3, 90, 40,
+                         help="בפרבולי הטווחים ענקיים — 20% מעל התמיכה זה "
+                              "כלום במנייה שזזה 300%.")
+
+    st.markdown("###### שערים עצמאיים לתבנית הזאת (לא מושפעים מהמסחר היומי)")
+    z1, z2, z3, z4 = st.columns(4)
+    pmin_px = z1.number_input("מחיר מינ׳ $ (פרבולי)", 0.1, 100.0, 0.5, 0.1,
+                              help="רוב הפרבוליים הם פני-סטוקס. DLXY נסחרה "
+                                   "ב-1.85$ אחרי המהלך. אל תעלה את זה מעל 2.")
+    pmax_px = z2.number_input("מחיר מקס׳ $ (פרבולי)", 0.0, 2000.0, 50.0, 5.0,
+                              help="0 = ללא הגבלה.")
+    prvol_min = z3.number_input("RVOL מינ׳ (פרבולי)", 0.0, 10.0, 0.0, 0.1,
+                                help="0 = כבוי, וזו ברירת המחדל בכוונה. "
+                                     "בזמן התיקון הנפח של פרבולי יורד מתחת "
+                                     "לרגיל — סף RVOL כאן פוסל בדיוק את "
+                                     "ההתכנסות שאתה מחפש.")
+    pmax_risk = z4.slider("סיכון מקס׳ לעסקה % (פרבולי)", 5, 60, 25, 5,
+                          help="מרחק הסטופ ממחיר הכניסה, באחוזים. בפרבולי "
+                               "התמיכה יכולה להיות רחוקה מאוד — התקרה הזאת "
+                               "מונעת סטופ מטורף שהורס את יחס הסיכון-סיכוי.")
+    z5, z6 = st.columns([1, 3])
+    pdv_min = z5.number_input("כסף בפריצה מינ׳ (מ׳ $)", 0.0, 500.0, 5.0, 1.0,
+                              help="ממוצע המחזור הדולרי בימי הפריצה. "
+                                   "מוציא ספייקים על מניות רפאים.")
 
     st.markdown("##### שבירת תמיכה ותפיסה מחדש")
     n1, n2, n3, n4 = st.columns(4)
@@ -1857,8 +1901,10 @@ CP = dict(pwin=max(win, 250), prise_min=prise_min, pretr_lo=pretr[0],
           pretr_hi=pretr[1], phold_min=phold_min, page_lo=page[0], page_hi=page[1],
           prun_min=prun_min, prun_max=prun_max, pdry_min=pdry_min,
           poff_max=poff_max, atr_abs=atr_abs, atr_pct=atr_pct, rr_min=rr_min,
-          need_trig=rev_hard, rvol_min=(rvol_min or None), max_px=(max_px or None),
-          leg_dv_min=(leg_dv_min or None))
+          need_trig=rev_hard,
+          prvol_min=(prvol_min or None), pmin_px=(pmin_px or None),
+          pmax_px=(pmax_px or None), pdv_min=(pdv_min or None),
+          pmax_risk=pmax_risk)
 
 CB = dict(win=win, sup_win=sup_win, break_win=break_win, break_min=break_min,
           break_max=break_max, reclaim_lo=reclaim_lo, reclaim_hi=reclaim_hi,
@@ -2341,8 +2387,15 @@ if go_:
         prog.progress(min(frac * 0.35, 0.35))
         note.caption(f"סינון מקדים · {kept:,} מניות עברו נזילות")
 
+    # The prescreen is a hard gate: anything it rejects never reaches ANY
+    # pattern. So its floors must be the loosest of every enabled pattern, not
+    # the day-trading ones. A $1.85 parabolic runner would otherwise be thrown
+    # out here and core_parabolic would never see it.
+    _par_on = ptype in ("פריצה פרבולית ותיקון", "כל התבניות")
+    pre_min_px = min(min_px, pmin_px) if _par_on else min_px
+    pre_min_dv = min(min_dv, pdv_min) if (_par_on and pdv_min) else min_dv
     survivors, _pre_px, pre_drops = prescreen_universe(
-        uni, min_price=min_px, min_dollar_vol_m=min_dv,
+        uni, min_price=pre_min_px, min_dollar_vol_m=pre_min_dv,
         batch=200, workers=3, on_progress=_tick_pre)
     drop.update(pre_drops)
 
@@ -2364,13 +2417,15 @@ if go_:
             prog.progress(0.80 + 0.20 * (i / max(len(items), 1)))
         try:
             p = float(d["Close"].iloc[-1])
-            if p < min_px:
+            if p < pre_min_px:
                 drop["מחיר נמוך"] = drop.get("מחיר נמוך", 0) + 1
                 continue
             avg_sh = float(d["Volume"].tail(20).mean())
-            if p * avg_sh < min_dv * 1e6:
+            if p * avg_sh < pre_min_dv * 1e6:
                 drop["מחזור נמוך"] = drop.get("מחזור נמוך", 0) + 1
                 continue
+            # Each pattern still applies its OWN price floor inside its core;
+            # this outer gate only removes what no pattern could ever want.
             if min_sh > 0 and avg_sh < min_sh * 1e6:
                 drop["נפח מניות נמוך"] = drop.get("נפח מניות נמוך", 0) + 1
                 continue

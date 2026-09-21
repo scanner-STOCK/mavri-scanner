@@ -184,6 +184,15 @@ a.tv:hover{color:var(--gd);}
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
+# Hard ceiling on yfinance's own internal threads per download call.
+# threads=True lets yfinance size its pool from os.cpu_count(), which on a
+# shared cloud host reports the HOST's cores — dozens — not the handful this
+# container is actually allowed. Multiplied by our own worker pool, a single
+# backtest tried to open ~360 threads and the platform refused with
+# "RuntimeError: can't start new thread". An explicit integer keeps the total
+# at (our workers x 6), which stays well inside any container limit.
+YF_THREADS = 6
+
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"}
 
@@ -326,7 +335,7 @@ def _download_batch(tickers, period="1y"):
     for attempt in range(1):  # Single attempt - speed over perfection
         try:
             raw = yf.download(list(tickers), period=period, interval="1d",
-                              group_by="ticker", auto_adjust=False, threads=True,
+                              group_by="ticker", auto_adjust=False, threads=YF_THREADS,
                               progress=False, timeout=20)  # Reduced from 30
         except Exception:
             raw = None
@@ -374,6 +383,44 @@ def clear_price_cache():
     for k in [k for k in list(st.session_state.keys())
               if k.startswith("_px_") or k == "_snap"]:
         del st.session_state[k]
+
+
+def run_batches(fn, batches, workers, on_each=None):
+    """Run fn over batches on a small thread pool, and never crash on the
+    platform's thread limit.
+
+    If the host refuses to start a thread (RuntimeError: can't start new
+    thread) — which happens on shared cloud containers when other sessions are
+    busy — the remaining batches run one by one on the current thread instead.
+    Slower, but the scan finishes instead of dying with a red traceback.
+    Yields each batch's result dict."""
+    results = []
+    pending = list(batches)
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {}
+            for b in pending:
+                futs[ex.submit(fn, b)] = b
+            for fut in as_completed(futs):
+                try:
+                    r = fut.result() or {}
+                except Exception:
+                    r = {}
+                results.append(r)
+                pending.remove(futs[fut])
+                if on_each:
+                    on_each(r)
+    except RuntimeError:
+        for b in list(pending):
+            try:
+                r = fn(b) or {}
+            except Exception:
+                r = {}
+            results.append(r)
+            pending.remove(b)
+            if on_each:
+                on_each(r)
+    return results
 
 
 def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=150,
@@ -432,18 +479,16 @@ def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=150,
 
     def _run(names, bsize, nworkers, frac0, frac1):
         bl = [tuple(names[i:i + bsize]) for i in range(0, len(names), bsize)]
-        got_all, k = {}, 0
-        with ThreadPoolExecutor(max_workers=nworkers) as ex:
-            futs = {ex.submit(_download_light, b): b for b in bl}
-            for fut in as_completed(futs):
-                try:
-                    got_all.update(fut.result() or {})
-                except Exception:
-                    pass
-                k += 1
-                if on_progress:
-                    on_progress(frac0 + (frac1 - frac0) * k / max(len(bl), 1),
-                                len(out) + len(got_all))
+        got_all, k = {}, [0]
+
+        def _each(r):
+            got_all.update(r)
+            k[0] += 1
+            if on_progress:
+                on_progress(frac0 + (frac1 - frac0) * k[0] / max(len(bl), 1),
+                            len(out) + len(got_all))
+
+        run_batches(_download_light, bl, nworkers, _each)
         return got_all
 
     # First pass. Measured the hard way: 500-name batches with four workers
@@ -484,7 +529,7 @@ def _download_light(tickers):
     out = {}
     try:
         raw = yf.download(list(tickers), period="10d", interval="1d",
-                          group_by="ticker", auto_adjust=False, threads=True,
+                          group_by="ticker", auto_adjust=False, threads=YF_THREADS,
                           progress=False, timeout=25)
     except Exception:
         return out
@@ -578,19 +623,16 @@ def fetch_universe_parallel(tickers, period="1y", batch=120, workers=3,
         return data, len(tickers) - len(data)
 
     batches = [tuple(missing[i:i + batch]) for i in range(0, len(missing), batch)]
-    done = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_download_batch, b, period): b for b in batches}
-        for fut in as_completed(futs):
-            try:
-                got = fut.result() or {}
-                data.update(got)
-                store.update(got)
-            except Exception:
-                pass
-            done += 1
-            if on_progress:
-                on_progress(done / len(batches), len(data))
+    done = [0]
+
+    def _each(got):
+        data.update(got)
+        store.update(got)
+        done[0] += 1
+        if on_progress:
+            on_progress(done[0] / len(batches), len(data))
+
+    run_batches(lambda b: _download_batch(b, period), batches, workers, _each)
     no_data = len(tickers) - len(data)
     return data, no_data
 
@@ -1585,7 +1627,7 @@ def live(tickers):
         return out
     try:
         raw = yf.download(list(tickers), period="1mo", interval="1d", group_by="ticker",
-                          auto_adjust=False, threads=True, progress=False, timeout=12)
+                          auto_adjust=False, threads=YF_THREADS, progress=False, timeout=12)
     except Exception:
         return out
     if raw is None or len(raw) == 0:
@@ -2047,7 +2089,7 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         # minutes of pure waiting on the network.
         note_b.caption("מוריד נתונים היסטוריים…")
         bt_market, bt_nodata = fetch_universe_parallel(
-            uni_bt, period=bt_period, batch=60, workers=6,
+            uni_bt, period=bt_period, batch=60, workers=3,
             on_progress=lambda f, g: prog_b.progress(min(f * 0.5, 0.5)))
         got_data = len(bt_market)
         chunks = [list(bt_market.items())[i:i + 60]

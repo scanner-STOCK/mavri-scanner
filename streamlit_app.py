@@ -12,6 +12,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -191,7 +192,34 @@ st.markdown(CSS, unsafe_allow_html=True)
 # backtest tried to open ~360 threads and the platform refused with
 # "RuntimeError: can't start new thread". An explicit integer keeps the total
 # at (our workers x 6), which stays well inside any container limit.
-YF_THREADS = 6
+YF_THREADS = 16
+
+# yf.download is NOT thread-safe. Its results live in one module-level dict,
+# yfinance.shared._DFS, which every call RESETS on entry (`shared._DFS = {}`)
+# and then polls until it holds as many entries as that call requested. Two
+# calls in flight at once wipe each other's results mid-download — and a call
+# whose entries were wiped can poll forever. This is a known yfinance issue
+# ("yfinance.download is not thread-safe", GitHub #2557).
+#
+# That single fact explains the whole history of this scanner's data problems:
+# 12% missing, then 52%, then 100%, and the page that "never finished loading".
+# Each was the same race with different timing.
+#
+# The fix is to never run two downloads at once: every call goes through one
+# process-wide lock, and parallelism comes from yfinance's OWN internal threads
+# (YF_THREADS), which is how the library is designed to be used. The lock is
+# stored on the yfinance module object so it survives Streamlit reruns and is
+# shared by every browser session in the process — sessions on Streamlit Cloud
+# run as threads of one process and share the same yfinance globals.
+if not hasattr(yf, "_mavri_lock"):
+    yf._mavri_lock = threading.Lock()
+
+
+def yf_download(*args, **kwargs):
+    """The only way this app calls yf.download. Serialised; see above."""
+    with yf._mavri_lock:
+        return yf.download(*args, **kwargs)
+
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"}
@@ -248,50 +276,75 @@ PRESETS = {
 }
 
 
+_JUNK_RE = (r"(?<!common )\bunits?\b|\bwarrants?\b|\brights?\b|"
+            r"\bpreferred\b|\bnotes? due\b|\bdebentures?\b|"
+            r"\bsubordinated\b|% ")
+# Not stock: SPAC units/warrants/rights, preferreds, notes. Two deliberate
+# exceptions, both verified against the live NASDAQ file:
+#   "common units"  — MLPs such as ARLP and DMLP trade exactly like shares.
+#   "depositary"    — ADRs (BABA, NIO, XPEV...) are "American Depositary
+#                     Shares"; the pattern never mentions the word at all.
+
+DIR_SOURCES = [
+    ("NASDAQ", "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+     "Symbol", "ETF", "Test Issue"),
+    ("NYSE", "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+     "ACT Symbol", "ETF", "Test Issue"),
+]
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_full_market():
-    """NASDAQ Trader's official symbol directory — every common stock listed on
-    NASDAQ, NYSE, NYSE American and NYSE Arca. This is the source that gets the
-    universe past a few hundred names into the thousands."""
-    out = []
-    for url, sym_col, etf_col, test_col in [
-        ("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
-         "Symbol", "ETF", "Test Issue"),
-        ("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
-         "ACT Symbol", "ETF", "Test Issue"),
-    ]:
+def _fetch_dir_file(url, sym_col, etf_col, test_col):
+    """One directory file, parsed to common-stock symbols.
+
+    RAISES on failure instead of returning a partial list — deliberately.
+    st.cache_data does not cache a call that raises, so a timeout is retried on
+    the next scan. The old code swallowed the error and returned whatever it
+    had, and that half-market list was then cached for 24 hours: one slow
+    response from nasdaqtrader.com and the scanner silently ran on ~2,500
+    names instead of ~6,000 until the next day."""
+    last = None
+    for attempt in range(3):
         try:
-            txt = requests.get(url, headers=UA, timeout=12).text
+            r = requests.get(url, headers=UA, timeout=25)
+            r.raise_for_status()
+            txt = r.text
+            if sym_col not in txt[:300]:
+                raise ValueError("unexpected payload")
             df = pd.read_csv(io.StringIO(txt), sep="|")
             df = df[df[test_col].astype(str).str.upper() != "Y"]
             if etf_col in df.columns:
                 df = df[df[etf_col].astype(str).str.upper() != "Y"]
-            # Drop instruments that are not common stock. The directory lists
-            # every SPAC warrant, unit and right as its own symbol — thousands
-            # of them — and Yahoo returns nothing for most. Each one was a
-            # wasted slot in a download batch and surfaced as "no data" in the
-            # funnel, making the scanner look broken when it was really asking
-            # for things that don't trade like shares.
             if "Security Name" in df.columns:
                 nm = df["Security Name"].astype(str).str.lower()
-                junk = nm.str.contains(
-                    r"\bwarrants?\b|\bunits?\b|\brights?\b|\bpreferred\b|"
-                    r"\bnotes? due\b|\bdebentures?\b|"
-                    r"\bsubordinated\b|% ", regex=True, na=False)
-                # NOTE: "depositary" is deliberately NOT in this list — ADRs
-                # such as BABA, NIO and XPEV are officially named "American
-                # Depositary Shares" and are ordinary tradeable equity.
-                df = df[~junk]
+                df = df[~nm.str.contains(_JUNK_RE, regex=True, na=False)]
             syms = [str(x).strip().upper().replace(".", "-") for x in df[sym_col]]
             syms = [x for x in syms if x.isascii() and 1 <= len(x) <= 5
                     and x.replace("-", "").isalpha()]
-            out += syms
+            if len(syms) < 800:
+                raise ValueError(f"only {len(syms)} symbols — truncated download?")
+            return syms
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"{url}: {last}")
+
+
+def fetch_full_market():
+    """Both exchange files. Returns (symbols, per-source counts). A source that
+    failed reports 0 and is retried on the next scan, because its failure was
+    never cached."""
+    out, counts = [], {}
+    for name, url, sc, ec, tc in DIR_SOURCES:
+        try:
+            got = _fetch_dir_file(url, sc, ec, tc)
+            out += got
+            counts[name] = len(got)
         except Exception:
-            pass
-    return out
+            counts[name] = 0
+    return out, counts
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
 def build_universe(limit):
     """Universe = curated liquid list FIRST, then NASDAQ Trader's official
     directory (~7,000 common stocks) for breadth.
@@ -308,8 +361,9 @@ def build_universe(limit):
     even 200 — always covers the tradeable universe before reaching into the
     alphabetical long tail."""
     log = []
-    full = fetch_full_market()
-    log.append(f"NASDAQ/NYSE:{len(full) or '—'}")
+    full, counts = fetch_full_market()
+    for k_, v_ in counts.items():
+        log.append(f"{k_}:{v_:,}" if v_ else f"{k_}: ⚠ לא נטען — ינסה שוב בסריקה הבאה")
 
     # Liquid, hand-curated names first — these must never be cut by `limit`.
     got = [t.upper() for t in BACKUP] + list(full)
@@ -334,7 +388,7 @@ def _download_batch(tickers, period="1y"):
     out = {}
     for attempt in range(1):  # Single attempt - speed over perfection
         try:
-            raw = yf.download(list(tickers), period=period, interval="1d",
+            raw = yf_download(list(tickers), period=period, interval="1d",
                               group_by="ticker", auto_adjust=False, threads=YF_THREADS,
                               progress=False, timeout=20)  # Reduced from 30
         except Exception:
@@ -423,8 +477,8 @@ def run_batches(fn, batches, workers, on_each=None):
     return results
 
 
-def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=150,
-                       workers=3, on_progress=None):
+def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=200,
+                       workers=1, on_progress=None):
     """Cheap first pass: 10 daily bars per ticker instead of a full year.
 
     WHY THIS EXISTS — this is what makes a 4,000-name scan possible at all.
@@ -503,7 +557,7 @@ def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=150,
     retry = [t for t in missing if t not in got]
     if retry:
         time.sleep(1.0)
-        got.update(_run(retry, 60, 2, 0.8, 1.0))
+        got.update(_run(retry, 80, 1, 0.8, 1.0))
 
     store.update(got)
     for t, (px, dv) in got.items():
@@ -528,7 +582,7 @@ def _download_light(tickers):
     is the whole point of the prescreen."""
     out = {}
     try:
-        raw = yf.download(list(tickers), period="10d", interval="1d",
+        raw = yf_download(list(tickers), period="10d", interval="1d",
                           group_by="ticker", auto_adjust=False, threads=YF_THREADS,
                           progress=False, timeout=25)
     except Exception:
@@ -568,7 +622,7 @@ def extended_hours_quote(ticker):
 
     Returns dict(price, change_pct, session) or None."""
     try:
-        d = yf.download(ticker, period="2d", interval="5m", prepost=True,
+        d = yf_download(ticker, period="2d", interval="5m", prepost=True,
                         auto_adjust=False, progress=False, timeout=15,
                         threads=False)
         if d is None or len(d) == 0:
@@ -602,7 +656,7 @@ def extended_hours_quote(ticker):
         return None
 
 
-def fetch_universe_parallel(tickers, period="1y", batch=120, workers=3,
+def fetch_universe_parallel(tickers, period="1y", batch=150, workers=1,
                             on_progress=None):
     """Download the universe with a few batches in flight at once.
 
@@ -644,7 +698,7 @@ def fetch_one(t, period, interval):
     of each other when Yahoo is rate-limiting one path."""
     for attempt in range(3):
         try:
-            d = yf.download(t, period=period, interval=interval, auto_adjust=False,
+            d = yf_download(t, period=period, interval=interval, auto_adjust=False,
                             progress=False, timeout=20, threads=False)
             if d is not None and len(d):
                 if isinstance(d.columns, pd.MultiIndex):
@@ -1626,7 +1680,7 @@ def live(tickers):
     if not tickers:
         return out
     try:
-        raw = yf.download(list(tickers), period="1mo", interval="1d", group_by="ticker",
+        raw = yf_download(list(tickers), period="1mo", interval="1d", group_by="ticker",
                           auto_adjust=False, threads=YF_THREADS, progress=False, timeout=12)
     except Exception:
         return out
@@ -2074,8 +2128,8 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         else:
             hi_px = max_px or _inf
         pool, _ = build_universe(max(bt_n * 8, 2000))
-        cand, cand_px, _ = prescreen_universe(pool, min_price=lo_px,
-                                              min_dollar_vol_m=lo_dv)
+        cand, cand_px, bt_pre_drops = prescreen_universe(pool, min_price=lo_px,
+                                                         min_dollar_vol_m=lo_dv)
         in_band = [t for t in cand if cand_px.get(t, 0) <= hi_px]
         uni_bt = in_band[:bt_n]
         note_pre.empty()
@@ -2089,7 +2143,7 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         # minutes of pure waiting on the network.
         note_b.caption("מוריד נתונים היסטוריים…")
         bt_market, bt_nodata = fetch_universe_parallel(
-            uni_bt, period=bt_period, batch=60, workers=3,
+            uni_bt, period=bt_period, batch=100, workers=1,
             on_progress=lambda f, g: prog_b.progress(min(f * 0.5, 0.5)))
         got_data = len(bt_market)
         chunks = [list(bt_market.items())[i:i + 60]
@@ -2119,6 +2173,7 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         st.session_state["bt_diag"] = dict(
             requested=len(uni_bt), got_data=got_data, errored=errored,
             pool=len(pool), in_band=len(in_band), ptype=ptype,
+            pre_drops=dict(bt_pre_drops), hi_px=hi_px, lo_px=lo_px,
             spy_ok=spy_hist is not None, when=datetime.now(il).strftime("%H:%M:%S"))
 
     if "bt_diag" in st.session_state:
@@ -2130,9 +2185,30 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
                   f"קיבלנו נתונים ל-{dg['got_data']} · SPY {'הצליח' if dg['spy_ok'] else 'נכשל'} "
                   f"· {dg['errored']} שגיאות בעיבוד.")
         if not st.session_state.get("bt"):
-            if dg["got_data"] == 0:
-                st.error("לא התקבלו נתונים בכלל — כנראה תקלת רשת זמנית מול Yahoo Finance. "
-                        "נסה שוב בעוד רגע.")
+            # Say WHERE it stopped. The old message blamed the network whenever
+            # nothing came back — including when SPY had just downloaded fine
+            # and the real cause was that zero stocks survived the prescreen.
+            pdr = dg.get("pre_drops") or {}
+            if dg.get("requested", 0) == 0:
+                nod = pdr.get("לא התקבלו נתונים", 0)
+                pool_n = max(dg.get("pool", 0), 1)
+                if nod >= 0.8 * pool_n:
+                    st.error(f"הסינון המקדים לא קיבל נתונים עבור {nod:,} מתוך "
+                             f"{pool_n:,} מניות, למרות ש-SPY ירד תקין. לחץ על ↻ "
+                             f"למעלה (מנקה מטמון) ונסה שוב.")
+                else:
+                    parts = " · ".join(f"{k}: {v:,}" for k, v in
+                                       sorted(pdr.items(), key=lambda x: -x[1]))
+                    _hi = dg.get("hi_px")
+                    _hi_txt = (f"עד ${_hi:,.0f}" if _hi and _hi != float("inf")
+                               else "ללא תקרה")
+                    st.warning(f"אף מנייה לא עברה את טווח המחיר והמחזור של הסינון "
+                               f"(מחיר מ-${dg.get('lo_px', 0):,.2f} {_hi_txt}). "
+                               f"פירוט: {parts or '—'}. הרפה את מחיר או מחזור "
+                               f"מינימלי בשורה העליונה.")
+            elif dg["got_data"] == 0:
+                st.error("המניות נבחרו אבל ההורדה ההיסטורית לא החזירה נתונים. "
+                         "כנראה תקלה זמנית מול Yahoo Finance — נסה שוב בעוד רגע.")
             else:
                 st.warning("התקבלו נתונים אבל אף עסקה לא נמצאה. המניות שנבדקו כבר "
                           "מתאימות לטווח המחיר של הסינון, כך שהסיבה היא התבנית עצמה: "
@@ -2559,7 +2635,7 @@ if go_:
     # modest request.
     survivors, _pre_px, pre_drops = prescreen_universe(
         uni, min_price=pre_min_px, min_dollar_vol_m=pre_min_dv,
-        batch=150, workers=3, on_progress=_tick_pre)
+        batch=200, workers=1, on_progress=_tick_pre)
     drop.update(pre_drops)
 
     # --- stage 2: full history for survivors only ---------------------------
@@ -2567,8 +2643,8 @@ if go_:
         prog.progress(0.35 + min(frac * 0.45, 0.45))
         note.caption(f"מוריד היסטוריה · {got:,} מתוך {len(survivors):,}")
 
-    market, no_data = fetch_universe_parallel(survivors, period="1y", batch=100,
-                                              workers=3, on_progress=_tick)
+    market, no_data = fetch_universe_parallel(survivors, period="1y", batch=150,
+                                              workers=1, on_progress=_tick)
     if no_data:
         drop["לא התקבלו נתונים"] = drop.get("לא התקבלו נתונים", 0) + no_data
 

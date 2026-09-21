@@ -11,7 +11,11 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import os
 import time
+import shutil
+import tempfile
+import importlib
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -192,7 +196,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 # backtest tried to open ~360 threads and the platform refused with
 # "RuntimeError: can't start new thread". An explicit integer keeps the total
 # at (our workers x 6), which stays well inside any container limit.
-YF_THREADS = 16
+YF_THREADS = 10
 
 # yf.download is NOT thread-safe. Its results live in one module-level dict,
 # yfinance.shared._DFS, which every call RESETS on entry (`shared._DFS = {}`)
@@ -215,10 +219,125 @@ if not hasattr(yf, "_mavri_lock"):
     yf._mavri_lock = threading.Lock()
 
 
+# ---- diagnostics ---------------------------------------------------------
+# Every download failure used to be swallowed by a bare `except: return {}`,
+# so a broken environment and a quiet market looked identical: "no data". The
+# wrapper now records the real exception and yfinance's own per-ticker error
+# messages, so the UI can show what actually went wrong. Stored on the yfinance
+# module, like the lock, so it is process-wide.
+def _yf_diag():
+    d = getattr(yf, "_mavri_diag", None)
+    if d is None:
+        d = {"exc": None, "exc_when": None, "ticker_errs": {}, "fallback": 0,
+             "calls": 0}
+        yf._mavri_diag = d
+    return d
+
+
+def _yf_diag_reset():
+    yf._mavri_diag = None
+
+
+def _yf_note(e):
+    d = _yf_diag()
+    d["exc"] = f"{type(e).__name__}: {str(e)[:300]}"
+    d["exc_when"] = time.strftime("%H:%M:%S")
+
+
+def _yf_collect_ticker_errors():
+    """yfinance does not raise for failed tickers — it files a message per
+    ticker in yfinance.shared._ERRORS and returns empty columns. Harvest those
+    right after each call (the next call resets the dict)."""
+    try:
+        sh = importlib.import_module("yfinance.shared")
+        errs = dict(getattr(sh, "_ERRORS", {}) or {})
+    except Exception:
+        return
+    if not errs:
+        return
+    te = _yf_diag()["ticker_errs"]
+    for msg in list(errs.values())[:300]:
+        m = str(msg)[:160]
+        te[m] = te.get(m, 0) + 1
+    if len(te) > 20:
+        keep = sorted(te.items(), key=lambda x: -x[1])[:20]
+        te.clear()
+        te.update(keep)
+
+
+# ---- private tz cache ------------------------------------------------------
+# yfinance keeps a small SQLite cache of ticker timezones. If a process dies
+# mid-write (as it did when the old code ran out of threads) that file can be
+# left locked or corrupt, and from then on EVERY lookup fails instantly —
+# before any network request. A private per-process directory sidesteps a
+# damaged shared file, and the refresh button can replace it on demand.
+def _yf_cache_dir(fresh=False):
+    cur = getattr(yf, "_mavri_cache_dir", None)
+    if cur and not fresh:
+        return cur
+    base = os.path.join(tempfile.gettempdir(), "mavri-yf")
+    if cur and fresh:
+        shutil.rmtree(cur, ignore_errors=True)
+    path = os.path.join(base, f"{os.getpid()}-{int(time.time())}")
+    try:
+        os.makedirs(path, exist_ok=True)
+        yf.set_tz_cache_location(path)
+        yf._mavri_cache_dir = path
+    except Exception:
+        pass
+    return getattr(yf, "_mavri_cache_dir", None)
+
+
+if not getattr(yf, "_mavri_cache_dir", None):
+    _yf_cache_dir()
+
+
 def yf_download(*args, **kwargs):
-    """The only way this app calls yf.download. Serialised; see above."""
+    """The only way this app calls yf.download. Serialised; see above.
+
+    Thread-ceiling fallback: if the process can no longer start threads
+    (RuntimeError: can't start new thread — e.g. threads left stuck forever by
+    the old race), a synchronous download (threads=False) starts none at all
+    and still works. Slower, but data keeps flowing until the next reboot."""
     with yf._mavri_lock:
-        return yf.download(*args, **kwargs)
+        d = _yf_diag()
+        d["calls"] += 1
+        try:
+            df = yf.download(*args, **kwargs)
+        except RuntimeError as e:
+            _yf_note(e)
+            if "thread" not in str(e).lower():
+                raise
+            d["fallback"] += 1
+            kwargs["threads"] = False
+            try:
+                df = yf.download(*args, **kwargs)
+            except Exception as e2:
+                _yf_note(e2)
+                raise
+        except Exception as e:
+            _yf_note(e)
+            raise
+        _yf_collect_ticker_errors()
+        return df
+
+
+def yf_hint(d, n_threads):
+    """Turn the recorded evidence into one plain-language diagnosis."""
+    top = sorted((d.get("ticker_errs") or {}).items(), key=lambda x: -x[1])[:3]
+    blob = " ".join([d.get("exc") or ""] + [m for m, _ in top]).lower()
+    if "rate" in blob or "too many" in blob or "429" in blob:
+        return ("Yahoo חוסם זמנית בגלל כמות בקשות (Rate limit). זה לא באג בקוד — "
+                "המתן 30-60 דקות ונסה שוב, עם פחות מניות לסריקה.")
+    if "database" in blob or "sqlite" in blob or "operationalerror" in blob:
+        return "מטמון פנימי של yfinance נפגם. לחץ על ↻ למעלה — הוא נמחק ונבנה מחדש."
+    if "thread" in blob or d.get("fallback") or n_threads > 150:
+        return ("התהליך הגיע לתקרת החוטים — שאריות מגרסה קודמת. Manage app → "
+                "Reboot app מנקה את זה. עד אז ההורדה רצה במצב איטי בלי חוטים.")
+    if not d.get("exc") and not top:
+        return ("לא נרשמה שום שגיאה — Yahoo החזיר תשובות ריקות בלי הסבר. "
+                "הרץ את בדיקת החיבור למטה.")
+    return "השגיאה המדויקת כתובה למעלה — צלם ושלח."
 
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -439,6 +558,48 @@ def clear_price_cache():
         del st.session_state[k]
 
 
+def render_yf_diagnostics(key):
+    """Shown whenever most of the universe came back empty. States the real
+    error, a plain diagnosis, and offers a 3-ticker live connection test."""
+    d = _yf_diag()
+    n_thr = threading.active_count()
+    ver = getattr(yf, "__version__", "?")
+    lines = [f"yfinance {ver} · חוטים פעילים בתהליך: {n_thr} · "
+             f"קריאות הורדה בריצה הזאת: {d.get('calls', 0)}"]
+    if d.get("fallback"):
+        lines.append(f"הורדות שרצו במצב חירום בלי חוטים: {d['fallback']}")
+    if d.get("exc"):
+        lines.append(f"שגיאה אחרונה ({d.get('exc_when')}): `{d['exc']}`")
+    for m, c in sorted((d.get("ticker_errs") or {}).items(),
+                       key=lambda x: -x[1])[:3]:
+        lines.append(f"{c:,}× `{m}`")
+    st.error("**אבחון הורדת נתונים**  \n" + "  \n".join(lines) +
+             f"  \n\n**מה זה אומר:** {yf_hint(d, n_thr)}")
+    if st.button("בדוק חיבור ל-Yahoo עכשיו (3 מניות)", key=f"yfdiag_{key}"):
+        t0 = time.time()
+        try:
+            raw = yf_download(["AAPL", "MSFT", "NVDA"], period="5d", interval="1d",
+                              group_by="ticker", auto_adjust=False, threads=False,
+                              progress=False, timeout=15)
+            ok = []
+            for t in ("AAPL", "MSFT", "NVDA"):
+                try:
+                    dd = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+                    if len(dd.dropna()):
+                        ok.append(t)
+                except Exception:
+                    pass
+            res = (f"התקבלו {len(ok)}/3 ({', '.join(ok) or '—'}) "
+                   f"תוך {time.time() - t0:.1f} שניות.")
+            if not ok:
+                res += " " + yf_hint(_yf_diag(), threading.active_count())
+        except Exception as e:
+            res = f"נכשל: {type(e).__name__}: {str(e)[:200]}"
+        st.session_state[f"yfdiag_res_{key}"] = res
+    if st.session_state.get(f"yfdiag_res_{key}"):
+        st.info("בדיקת חיבור: " + st.session_state[f"yfdiag_res_{key}"])
+
+
 def run_batches(fn, batches, workers, on_each=None):
     """Run fn over batches on a small thread pool, and never crash on the
     platform's thread limit.
@@ -450,6 +611,19 @@ def run_batches(fn, batches, workers, on_each=None):
     Yields each batch's result dict."""
     results = []
     pending = list(batches)
+    if workers <= 1:
+        # With the download lock in place, extra workers would only queue on it.
+        # Running inline needs no thread at all — which matters exactly when
+        # the process is at its thread ceiling.
+        for b in pending:
+            try:
+                r = fn(b) or {}
+            except Exception:
+                r = {}
+            results.append(r)
+            if on_each:
+                on_each(r)
+        return results
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {}
@@ -1916,6 +2090,7 @@ fresh = s2.button("↻", use_container_width=True,
 if fresh:
     fetch.clear()
     clear_price_cache()
+    _yf_cache_dir(fresh=True)
     go_ = True
 
 ptype = st.radio("סוג תבנית",
@@ -2101,6 +2276,7 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
     bt_comm = bcc2.number_input("עמלה למניה $", 0.0, 1.0, 0.005, 0.001, format="%.3f")
 
     if st.button("הרץ בדיקה היסטורית", type="primary"):
+        _yf_diag_reset()
         # The backtest used to take the first N names of the universe — and the
         # universe is deliberately liquidity-first, so those are AAPL, MSFT,
         # NVDA, GOOGL... With the day-trading preset (price <= $80, ATR >= 4%)
@@ -2193,9 +2369,9 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
                 nod = pdr.get("לא התקבלו נתונים", 0)
                 pool_n = max(dg.get("pool", 0), 1)
                 if nod >= 0.8 * pool_n:
-                    st.error(f"הסינון המקדים לא קיבל נתונים עבור {nod:,} מתוך "
-                             f"{pool_n:,} מניות, למרות ש-SPY ירד תקין. לחץ על ↻ "
-                             f"למעלה (מנקה מטמון) ונסה שוב.")
+                    st.caption(f"הסינון המקדים לא קיבל נתונים עבור {nod:,} מתוך "
+                               f"{pool_n:,} מניות.")
+                    render_yf_diagnostics("bt")
                 else:
                     parts = " · ".join(f"{k}: {v:,}" for k, v in
                                        sorted(pdr.items(), key=lambda x: -x[1]))
@@ -2601,6 +2777,7 @@ if st.session_state.get("open"):
 
 if go_:
     t0 = time.time()
+    _yf_diag_reset()
     uni, uni_log = build_universe(limit)
     st.caption("יקום: " + " · ".join(uni_log) + f"  →  **{len(uni):,}** מניות ייחודיות")
 
@@ -2861,6 +3038,11 @@ else:
                     f'פרטים מלאים בפאנל "מפל הסינון" למטה.</div>',
                     unsafe_allow_html=True)
 
+    _nod = st.session_state["drop"].get("לא התקבלו נתונים", 0)
+    if _nod >= 0.8 * max(u, 1):
+        # Most of the universe returned nothing: this is a data failure, not an
+        # empty market. Say so plainly before any advice about loosening filters.
+        render_yf_diagnostics("scan")
     if not rows:
         st.markdown('<div class="empty">אין מניות בתבנית בסינון הזה.<br>'
                     'התבנית נדירה — נסה את הפריסט הרחב לפני שאתה מרפה ידנית.</div>',

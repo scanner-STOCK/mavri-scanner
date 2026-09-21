@@ -499,32 +499,101 @@ def build_universe(limit):
     return out[:limit], log
 
 
-def _download_batch(tickers, period="1y"):
-    """Raw batch download with one retry. Aggressive timeouts for speed.
-    
-    FAST MODE: timeout=20s, single attempt. Network failures are recovered
-    by having multiple batches in flight at once."""
-    out = {}
-    for attempt in range(1):  # Single attempt - speed over perfection
+# Parallelism without yf.download. Its thread-safety bug lives entirely in
+# the global results dict (shared._DFS); Ticker.history downloads ONE ticker
+# into its own DataFrame and never touches that dict. It is the exact call
+# yf.download makes internally for each ticker — minus the broken part. So we
+# run our own pool of Ticker.history calls: full concurrency, no race, no lock.
+PER_TICKER_WORKERS = 24
+
+
+def _diag_lock():
+    lk = getattr(yf, "_mavri_diag_lock", None)
+    if lk is None:
+        lk = threading.Lock()
+        yf._mavri_diag_lock = lk
+    return lk
+
+
+def _note_ticker_error(e):
+    msg = f"{type(e).__name__}: {str(e)[:140]}"
+    with _diag_lock():
+        d = _yf_diag()
+        d["exc"] = msg
+        d["exc_when"] = time.strftime("%H:%M:%S")
+        te = d["ticker_errs"]
+        te[msg] = te.get(msg, 0) + 1
+        if len(te) > 40:
+            keep = sorted(te.items(), key=lambda x: -x[1])[:20]
+            te.clear()
+            te.update(keep)
+
+
+def _history_one(t, period):
+    """One ticker, daily bars, tz-naive index (same shape yf.download gave)."""
+    with _diag_lock():
+        _yf_diag()["calls"] += 1
+    tk = yf.Ticker(t)
+    try:
         try:
-            raw = yf_download(list(tickers), period=period, interval="1d",
-                              group_by="ticker", auto_adjust=False, threads=YF_THREADS,
-                              progress=False, timeout=20)  # Reduced from 30
-        except Exception:
-            raw = None
-        if raw is not None and len(raw):
-            for t in tickers:
-                if t in out:
-                    continue
+            d = tk.history(period=period, interval="1d", auto_adjust=False,
+                           actions=False, raise_errors=True)
+        except TypeError:       # older yfinance without raise_errors
+            d = tk.history(period=period, interval="1d", auto_adjust=False,
+                           actions=False)
+    except Exception as e:
+        _note_ticker_error(e)
+        return None
+    if d is None or len(d) == 0:
+        return None
+    try:
+        if getattr(d.index, "tz", None) is not None:
+            d.index = d.index.tz_localize(None)
+        return d[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    except Exception as e:
+        _note_ticker_error(e)
+        return None
+
+
+def _pool_map(fn, items, workers=PER_TICKER_WORKERS, on_progress=None):
+    """Map fn over items on ONE continuous thread pool; if the process cannot
+    start threads, finish the remainder inline instead of failing.
+
+    One pool over the whole list, not a pool per batch: with batches, every
+    batch waited for its slowest ticker before the next could start, leaving
+    most workers idle at each boundary. on_progress(done_count) is called from
+    the calling thread, so it may safely touch Streamlit elements."""
+    out, done = {}, set()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(fn, it): it for it in items}
+            for fut in as_completed(futs):
+                it = futs[fut]
                 try:
-                    d = (raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw).dropna()
-                    if len(d) >= 90:
-                        out[t] = d
+                    out[it] = fut.result()
                 except Exception:
-                    pass
-        if len(out) > 0 or attempt == 0:
-            break
+                    out[it] = None
+                done.add(it)
+                if on_progress and (len(done) % 25 == 0 or len(done) == len(futs)):
+                    on_progress(len(done))
+    except RuntimeError:
+        with _diag_lock():
+            _yf_diag()["fallback"] += 1
+        for it in items:
+            if it not in done:
+                try:
+                    out[it] = fn(it)
+                except Exception:
+                    out[it] = None
     return out
+
+
+def _download_batch(tickers, period="1y", on_progress=None, workers=PER_TICKER_WORKERS):
+    """Daily history for a list of tickers, 24 at a time."""
+    need = 90 if period not in ("5d", "10d") else 3
+    res = _pool_map(lambda t: _history_one(t, period), list(tickers),
+                    workers=workers, on_progress=on_progress)
+    return {t: d for t, d in res.items() if d is not None and len(d) >= need}
 
 
 @st.cache_data(ttl=1800, max_entries=120, show_spinner=False)
@@ -705,33 +774,24 @@ def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=200,
             drops["לא התקבלו נתונים"] = miss0
         return out, prices, drops
 
-    def _run(names, bsize, nworkers, frac0, frac1):
-        bl = [tuple(names[i:i + bsize]) for i in range(0, len(names), bsize)]
-        got_all, k = {}, [0]
+    def _run(names, nworkers, frac0, frac1):
+        total = max(len(names), 1)
 
-        def _each(r):
-            got_all.update(r)
-            k[0] += 1
+        def _p(k):
             if on_progress:
-                on_progress(frac0 + (frac1 - frac0) * k[0] / max(len(bl), 1),
-                            len(out) + len(got_all))
+                on_progress(frac0 + (frac1 - frac0) * k / total, len(out) + k)
 
-        run_batches(_download_light, bl, nworkers, _each)
-        return got_all
+        return _download_light(names, on_progress=_p, workers=nworkers)
 
-    # First pass. Measured the hard way: 500-name batches with four workers
-    # left 52% of the universe with NO data. yf.download spawns its own thread
-    # per ticker, so the real concurrency was up to 2,000 simultaneous requests
-    # and Yahoo simply refused most of them. 150 x 3 keeps it near 450.
-    got = _run(missing, batch, workers, 0.0, 0.8)
+    # One continuous pool across every missing ticker.
+    got = _run(missing, PER_TICKER_WORKERS, 0.0, 0.85)
 
-    # Recovery pass. Whatever came back empty is retried once in small batches
-    # with low concurrency. Most of it was rate-limited, not missing, and a
-    # quiet second request succeeds.
+    # Recovery pass at gentler concurrency for whatever came back empty —
+    # mostly transient refusals, which a quieter second request gets through.
     retry = [t for t in missing if t not in got]
-    if retry:
+    if retry and len(retry) < 0.8 * len(missing):
         time.sleep(1.0)
-        got.update(_run(retry, 80, 1, 0.8, 1.0))
+        got.update(_run(retry, 8, 0.85, 1.0))
 
     store.update(got)
     for t, (px, dv) in got.items():
@@ -749,41 +809,18 @@ def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=200,
     return out, prices, drops
 
 
-def _download_light(tickers):
-    """10 bars per ticker, reduced to (last_close, avg_dollar_volume).
-
-    Returns scalars, not DataFrames — nothing heavy is kept in memory, which
-    is the whole point of the prescreen."""
-    out = {}
-    try:
-        raw = yf_download(list(tickers), period="10d", interval="1d",
-                          group_by="ticker", auto_adjust=False, threads=YF_THREADS,
-                          progress=False, timeout=25)
-    except Exception:
-        return out
-    if raw is None or len(raw) == 0:
-        return out
-    multi = isinstance(raw.columns, pd.MultiIndex)
-    for t in tickers:
-        try:
-            d = raw[t] if multi else raw
-            # No dropna() here. Measured: dropna costs 220% on top of the
-            # column access, and the prescreen only needs the last valid close
-            # and an average volume — both of which numpy handles with nan-aware
-            # functions at a fraction of the price. Over 7,000 tickers that is
-            # seconds of pure waste on a one-CPU host.
-            cl = d["Close"].to_numpy(dtype="float64", na_value=np.nan)
-            vo = d["Volume"].to_numpy(dtype="float64", na_value=np.nan)
-            ok = np.isfinite(cl)
-            if ok.sum() < 3:
-                continue
-            px = float(cl[ok][-1])
-            vol = float(np.nanmean(vo[-10:]))
-            if px > 0 and np.isfinite(vol) and vol > 0:
-                out[t] = (px, px * vol)
-        except Exception:
-            pass
-    return out
+def _download_light(tickers, on_progress=None, workers=PER_TICKER_WORKERS):
+    """10 bars per ticker reduced to (last_close, avg_dollar_volume). Scalars
+    only — nothing heavy is kept, which is the point of the prescreen."""
+    def one(t):
+        d = _history_one(t, "10d")
+        if d is None or len(d) < 3:
+            return None
+        px = float(d["Close"].iloc[-1])
+        vol = float(d["Volume"].tail(10).mean())
+        return (px, px * vol) if px > 0 and vol > 0 else None
+    res = _pool_map(one, list(tickers), workers=workers, on_progress=on_progress)
+    return {t: v for t, v in res.items() if v is not None}
 
 
 def extended_hours_quote(ticker):
@@ -850,17 +887,15 @@ def fetch_universe_parallel(tickers, period="1y", batch=150, workers=1,
             on_progress(1.0, len(data))
         return data, len(tickers) - len(data)
 
-    batches = [tuple(missing[i:i + batch]) for i in range(0, len(missing), batch)]
-    done = [0]
+    total = max(len(missing), 1)
 
-    def _each(got):
-        data.update(got)
-        store.update(got)
-        done[0] += 1
+    def _p(k):
         if on_progress:
-            on_progress(done[0] / len(batches), len(data))
+            on_progress(k / total, len(data) + k)
 
-    run_batches(lambda b: _download_batch(b, period), batches, workers, _each)
+    got = _download_batch(missing, period, on_progress=_p)
+    data.update(got)
+    store.update(got)
     no_data = len(tickers) - len(data)
     return data, no_data
 
@@ -2289,7 +2324,8 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         # population the pattern actually trades. The liquidity snapshot is
         # shared with the scanner, so after a scan this step is nearly free.
         note_pre = st.empty()
-        note_pre.caption("בוחר מניות שמתאימות לסינון הנוכחי…")
+        prog_pre = st.progress(0.0)
+        note_pre.caption("שלב 1/3 · בוחר מניות שמתאימות לסינון הנוכחי…")
         _par = ptype in ("פריצה פרבולית ותיקון", "כל התבניות")
         _only_par = ptype == "פריצה פרבולית ותיקון"
         lo_px = (pmin_px if _only_par else
@@ -2303,9 +2339,19 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
             hi_px = max(max_px or _inf, pmax_px or _inf)
         else:
             hi_px = max_px or _inf
-        pool, _ = build_universe(max(bt_n * 8, 2000))
-        cand, cand_px, bt_pre_drops = prescreen_universe(pool, min_price=lo_px,
-                                                         min_dollar_vol_m=lo_dv)
+        # 4x the requested sample is enough: roughly a quarter to a third of
+        # names clear the price/volume band. The old 8x (4,000 names for a
+        # 500-stock test) spent minutes on candidates that were never used.
+        # After a scan these snapshots are already cached and this is instant.
+        pool, _ = build_universe(max(bt_n * 4, 1200))
+
+        def _tick_bt_pre(frac, kept):
+            prog_pre.progress(min(frac, 1.0))
+            note_pre.caption(f"שלב 1/3 · בוחר מניות · {kept:,} מתאימות עד כה")
+
+        cand, cand_px, bt_pre_drops = prescreen_universe(
+            pool, min_price=lo_px, min_dollar_vol_m=lo_dv, on_progress=_tick_bt_pre)
+        prog_pre.empty()
         in_band = [t for t in cand if cand_px.get(t, 0) <= hi_px]
         uni_bt = in_band[:bt_n]
         note_pre.empty()
@@ -2317,7 +2363,7 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         # Previously each 60-name chunk was downloaded and processed before the
         # next one even started, so a 500-name / 5y backtest could take many
         # minutes of pure waiting on the network.
-        note_b.caption("מוריד נתונים היסטוריים…")
+        note_b.caption(f"שלב 2/3 · מוריד {len(uni_bt):,} היסטוריות…")
         bt_market, bt_nodata = fetch_universe_parallel(
             uni_bt, period=bt_period, batch=100, workers=1,
             on_progress=lambda f, g: prog_b.progress(min(f * 0.5, 0.5)))
@@ -2325,7 +2371,8 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         chunks = [list(bt_market.items())[i:i + 60]
                   for i in range(0, len(bt_market), 60)]
         for ci, ch in enumerate(chunks):
-            note_b.caption(f"מנה {ci+1}/{len(chunks)} · {len(trades)} עסקאות עד כה")
+            note_b.caption(f"שלב 3/3 · מנתח מנה {ci+1}/{len(chunks)} · "
+                           f"{len(trades)} עסקאות עד כה")
             for t, dd in ch:
                 try:
                     if float(dd["Close"].iloc[-1]) < min_px:

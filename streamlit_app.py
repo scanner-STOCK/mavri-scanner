@@ -1989,7 +1989,8 @@ CB = dict(win=win, sup_win=sup_win, break_win=break_win, break_min=break_min,
           trend_hard=trend_hard, rs_min=(rs_min_val if use_rs else None),
           rvol_min=(rvol_min or None), max_px=(max_px or None))
 
-with st.expander("בדיקה היסטורית — לפני שסומכים על סינון חדש"):
+with st.expander("בדיקה היסטורית — לפני שסומכים על סינון חדש",
+                 expanded=bool(st.session_state.get("bt_diag"))):
     st.markdown("בודק כל איתות היסטורי שהמסננים שלמעלה היו מזהים, ועוקב קדימה: "
                "האם ההוראה התמלאה, והאם המחיר הגיע ליעד לפני הסטופ. משתמש **באותן** "
                "פונקציות שהסורק החי משתמש בהן — לא חישוב נפרד.")
@@ -2004,7 +2005,38 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
     bt_comm = bcc2.number_input("עמלה למניה $", 0.0, 1.0, 0.005, 0.001, format="%.3f")
 
     if st.button("הרץ בדיקה היסטורית", type="primary"):
-        uni_bt, _ = build_universe(bt_n)
+        # The backtest used to take the first N names of the universe — and the
+        # universe is deliberately liquidity-first, so those are AAPL, MSFT,
+        # NVDA, GOOGL... With the day-trading preset (price <= $80, ATR >= 4%)
+        # almost none of them could pass the filters on ANY day in two years.
+        # Result: zero trades, which answered "is this pattern profitable?"
+        # on stocks the scanner would never have looked at.
+        #
+        # Now the sample is drawn from names that clear the same price band and
+        # dollar-volume floor the live scan uses, so the backtest tests the
+        # population the pattern actually trades. The liquidity snapshot is
+        # shared with the scanner, so after a scan this step is nearly free.
+        note_pre = st.empty()
+        note_pre.caption("בוחר מניות שמתאימות לסינון הנוכחי…")
+        _par = ptype in ("פריצה פרבולית ותיקון", "כל התבניות")
+        _only_par = ptype == "פריצה פרבולית ותיקון"
+        lo_px = (pmin_px if _only_par else
+                 (min(min_px, pmin_px) if _par else min_px))
+        lo_dv = (pdv_min if _only_par and pdv_min else
+                 (min(min_dv, pdv_min) if (_par and pdv_min) else min_dv))
+        _inf = float("inf")
+        if _only_par:
+            hi_px = pmax_px or _inf
+        elif _par:
+            hi_px = max(max_px or _inf, pmax_px or _inf)
+        else:
+            hi_px = max_px or _inf
+        pool, _ = build_universe(max(bt_n * 8, 2000))
+        cand, cand_px, _ = prescreen_universe(pool, min_price=lo_px,
+                                              min_dollar_vol_m=lo_dv)
+        in_band = [t for t in cand if cand_px.get(t, 0) <= hi_px]
+        uni_bt = in_band[:bt_n]
+        note_pre.empty()
         spy_hist = fetch(("SPY",), period=bt_period).get("SPY")
         spy_series = spy_return_lookup(spy_hist) if spy_hist is not None else None
         prog_b, note_b, live_b = st.progress(0.0), st.empty(), st.empty()
@@ -2044,11 +2076,15 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
         st.session_state["bt"] = trades
         st.session_state["bt_diag"] = dict(
             requested=len(uni_bt), got_data=got_data, errored=errored,
+            pool=len(pool), in_band=len(in_band), ptype=ptype,
             spy_ok=spy_hist is not None, when=datetime.now(il).strftime("%H:%M:%S"))
 
     if "bt_diag" in st.session_state:
         dg = st.session_state["bt_diag"]
-        st.caption(f"ריצה אחרונה ({dg['when']}): ביקשנו {dg['requested']} מניות · "
+        _pool_txt = (f"מתוך {dg['pool']:,} מניות, {dg['in_band']:,} מתאימות לטווח "
+                     f"המחיר והמחזור של הסינון · " if dg.get("pool") else "")
+        st.caption(f"ריצה אחרונה ({dg['when']}) · תבנית: {dg.get('ptype', '—')} · "
+                  f"{_pool_txt}נבדקו {dg['requested']} · "
                   f"קיבלנו נתונים ל-{dg['got_data']} · SPY {'הצליח' if dg['spy_ok'] else 'נכשל'} "
                   f"· {dg['errored']} שגיאות בעיבוד.")
         if not st.session_state.get("bt"):
@@ -2056,9 +2092,11 @@ with st.expander("בדיקה היסטורית — לפני שסומכים על �
                 st.error("לא התקבלו נתונים בכלל — כנראה תקלת רשת זמנית מול Yahoo Finance. "
                         "נסה שוב בעוד רגע.")
             else:
-                st.warning("התקבלו נתונים אבל אף עסקה לא נמצאה. עם 100 מניות ותקופה של "
-                          "שנתיים זה קורה כשהסינון מחמיר מדי — נסה: יותר מניות, תקופה "
-                          "של 5y, או הרפה זמנית את יובש הנפח / ימים מהשיא למעלה.")
+                st.warning("התקבלו נתונים אבל אף עסקה לא נמצאה. המניות שנבדקו כבר "
+                          "מתאימות לטווח המחיר של הסינון, כך שהסיבה היא התבנית עצמה: "
+                          "השילוב של כל התנאים לא קרה אפילו פעם אחת. נסה קודם "
+                          "500 מניות ותקופה של 5y. אם גם אז אפס — התבנית בהגדרות "
+                          "האלה נדירה מדי כדי למדוד אותה.")
 
     if "bt" in st.session_state and st.session_state["bt"]:
         b = pd.DataFrame(st.session_state["bt"])

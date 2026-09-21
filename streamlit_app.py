@@ -257,6 +257,22 @@ def fetch_full_market():
             df = df[df[test_col].astype(str).str.upper() != "Y"]
             if etf_col in df.columns:
                 df = df[df[etf_col].astype(str).str.upper() != "Y"]
+            # Drop instruments that are not common stock. The directory lists
+            # every SPAC warrant, unit and right as its own symbol — thousands
+            # of them — and Yahoo returns nothing for most. Each one was a
+            # wasted slot in a download batch and surfaced as "no data" in the
+            # funnel, making the scanner look broken when it was really asking
+            # for things that don't trade like shares.
+            if "Security Name" in df.columns:
+                nm = df["Security Name"].astype(str).str.lower()
+                junk = nm.str.contains(
+                    r"\bwarrants?\b|\bunits?\b|\brights?\b|\bpreferred\b|"
+                    r"\bnotes? due\b|\bdebentures?\b|"
+                    r"\bsubordinated\b|% ", regex=True, na=False)
+                # NOTE: "depositary" is deliberately NOT in this list — ADRs
+                # such as BABA, NIO and XPEV are officially named "American
+                # Depositary Shares" and are ordinary tradeable equity.
+                df = df[~junk]
             syms = [str(x).strip().upper().replace(".", "-") for x in df[sym_col]]
             syms = [x for x in syms if x.isascii() and 1 <= len(x) <= 5
                     and x.replace("-", "").isalpha()]
@@ -360,8 +376,8 @@ def clear_price_cache():
         del st.session_state[k]
 
 
-def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=500,
-                       workers=4, on_progress=None):
+def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=150,
+                       workers=3, on_progress=None):
     """Cheap first pass: 10 daily bars per ticker instead of a full year.
 
     WHY THIS EXISTS — this is what makes a 4,000-name scan possible at all.
@@ -414,28 +430,46 @@ def prescreen_universe(tickers, min_price, min_dollar_vol_m, batch=500,
             drops["לא התקבלו נתונים"] = miss0
         return out, prices, drops
 
-    batches = [tuple(missing[i:i + batch]) for i in range(0, len(missing), batch)]
-    done = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_download_light, b): b for b in batches}
-        for fut in as_completed(futs):
-            try:
-                got = fut.result() or {}
-            except Exception:
-                got = {}
-            store.update(got)
-            for t, (px, dv) in got.items():
-                if px < min_price:
-                    drops["מחיר נמוך"] = drops.get("מחיר נמוך", 0) + 1
-                    continue
-                if dv < min_dollar_vol_m * 1e6:
-                    drops["מחזור נמוך"] = drops.get("מחזור נמוך", 0) + 1
-                    continue
-                out.append(t)
-                prices[t] = px
-            done += 1
-            if on_progress:
-                on_progress(done / len(batches), len(out))
+    def _run(names, bsize, nworkers, frac0, frac1):
+        bl = [tuple(names[i:i + bsize]) for i in range(0, len(names), bsize)]
+        got_all, k = {}, 0
+        with ThreadPoolExecutor(max_workers=nworkers) as ex:
+            futs = {ex.submit(_download_light, b): b for b in bl}
+            for fut in as_completed(futs):
+                try:
+                    got_all.update(fut.result() or {})
+                except Exception:
+                    pass
+                k += 1
+                if on_progress:
+                    on_progress(frac0 + (frac1 - frac0) * k / max(len(bl), 1),
+                                len(out) + len(got_all))
+        return got_all
+
+    # First pass. Measured the hard way: 500-name batches with four workers
+    # left 52% of the universe with NO data. yf.download spawns its own thread
+    # per ticker, so the real concurrency was up to 2,000 simultaneous requests
+    # and Yahoo simply refused most of them. 150 x 3 keeps it near 450.
+    got = _run(missing, batch, workers, 0.0, 0.8)
+
+    # Recovery pass. Whatever came back empty is retried once in small batches
+    # with low concurrency. Most of it was rate-limited, not missing, and a
+    # quiet second request succeeds.
+    retry = [t for t in missing if t not in got]
+    if retry:
+        time.sleep(1.0)
+        got.update(_run(retry, 60, 2, 0.8, 1.0))
+
+    store.update(got)
+    for t, (px, dv) in got.items():
+        if px < min_price:
+            drops["מחיר נמוך"] = drops.get("מחיר נמוך", 0) + 1
+            continue
+        if dv < min_dollar_vol_m * 1e6:
+            drops["מחזור נמוך"] = drops.get("מחזור נמוך", 0) + 1
+            continue
+        out.append(t)
+        prices[t] = px
     missing = len(tickers) - sum(drops.values()) - len(out)
     if missing > 0:
         drops["לא התקבלו נתונים"] = missing
@@ -2445,7 +2479,7 @@ if go_:
     # modest request.
     survivors, _pre_px, pre_drops = prescreen_universe(
         uni, min_price=pre_min_px, min_dollar_vol_m=pre_min_dv,
-        batch=500, workers=4, on_progress=_tick_pre)
+        batch=150, workers=3, on_progress=_tick_pre)
     drop.update(pre_drops)
 
     # --- stage 2: full history for survivors only ---------------------------
@@ -2453,8 +2487,8 @@ if go_:
         prog.progress(0.35 + min(frac * 0.45, 0.45))
         note.caption(f"מוריד היסטוריה · {got:,} מתוך {len(survivors):,}")
 
-    market, no_data = fetch_universe_parallel(survivors, period="1y", batch=200,
-                                              workers=4, on_progress=_tick)
+    market, no_data = fetch_universe_parallel(survivors, period="1y", batch=100,
+                                              workers=3, on_progress=_tick)
     if no_data:
         drop["לא התקבלו נתונים"] = drop.get("לא התקבלו נתונים", 0) + no_data
 
